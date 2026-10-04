@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QByteArray, QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, QFileSystemWatcher, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QImageReader, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -839,6 +839,13 @@ class MainWindow(QMainWindow):
         self._apply_settings(load_settings())
         self._loading = False
         self.engine.set_cap(float(self.cap_spin.value()))
+        self.discarded: set[str] = set()
+        self.file_watcher = QFileSystemWatcher(self)
+        self.file_watcher.directoryChanged.connect(self._schedule_file_check)
+        self.file_watcher.fileChanged.connect(self._schedule_file_check)
+        self._file_check = QTimer(self)
+        self._file_check.setSingleShot(True)
+        self._file_check.timeout.connect(self._forget_missing_files)
         self.load_manifest()
         self._key_status()
         shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
@@ -1162,7 +1169,10 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.reject_button)
         side.addLayout(actions)
         side.addWidget(another)
-        side.addWidget(muted("This asks for a new image with the original brief and references. It does not attach the selected image."))
+        side.addWidget(muted(
+            "This asks for a new image from the original brief. The selected image is attached only as the look to stay close to. "
+            "It is not a chat, and the rejected pictures are still left out."
+        ))
         self.change_text = PlainText()
         self.change_text.setFixedHeight(70)
         self.change_text.setPlaceholderText("Describe one change to the selected image. The original brief stays in the request.")
@@ -1178,10 +1188,18 @@ class MainWindow(QMainWindow):
         reveal = QPushButton("Show in Finder")
         reveal.setObjectName("secondary")
         reveal.clicked.connect(self.reveal_selected)
+        remove_image = QPushButton("Remove image")
+        remove_image.setObjectName("secondary")
+        remove_image.clicked.connect(self.remove_selected)
         file_row.addWidget(open_image)
         file_row.addWidget(reveal)
+        file_row.addWidget(remove_image)
         side.addLayout(file_row)
-        side.addWidget(muted("Approving copies the file into the approved folder. Rejecting leaves the file where it is. The reviewer can miss errors. Your decision is the one that counts."))
+        side.addWidget(muted(
+            "Approving copies the file into the approved folder. Rejecting leaves the file where it is. "
+            "Remove image deletes the file from the output folder and from this list. "
+            "The reviewer can miss errors. Your decision is the one that counts."
+        ))
         self.review_scroll = QScrollArea()
         self.review_scroll.setWidgetResizable(True)
         self.review_scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1688,6 +1706,16 @@ class MainWindow(QMainWindow):
         cid = str(record.get("id") or "")
         if not cid:
             return
+        if cid in self.discarded:
+            self._delete_saved_files(record)
+            return
+        path = str(record.get("path") or "")
+        if path and not Path(path).is_file():
+            self.discarded.add(cid)
+            self._drop_record(cid)
+            self.save_manifest()
+            self._sync_file_watches()
+            return
         existing = self.candidates.get(cid)
         if existing and existing.get("status") in {"approved", "rejected"}:
             record["status"] = existing["status"]
@@ -1704,6 +1732,7 @@ class MainWindow(QMainWindow):
         self._review_title()
         if self._selected_id() == cid:
             self.show_record(record)
+        self._sync_file_watches()
 
     def _render_item(self, record: dict) -> None:
         cid = str(record["id"])
@@ -1765,17 +1794,29 @@ class MainWindow(QMainWindow):
             except (OSError, json.JSONDecodeError):
                 self.append_log("Could not read manifest.json in the output folder.")
                 payload = {}
+            removed = 0
             for record in payload.get("candidates") or []:
                 if not isinstance(record, dict) or not record.get("id"):
                     continue
                 normalized = self._normalize_loaded(record)
+                image_path = str(normalized.get("path") or "")
+                if image_path and not Path(image_path).is_file():
+                    removed += 1
+                    continue
                 cid = str(normalized["id"])
                 self.order.append(cid)
                 self.candidates[cid] = normalized
                 self._render_item(normalized)
+            if removed:
+                self.save_manifest()
+                if removed == 1:
+                    self.append_log("Removed an image that is no longer in the output folder.")
+                else:
+                    self.append_log(f"Removed {removed} images that are no longer in the output folder.")
         self.refresh_totals()
         self._review_title()
         self.show_record(None)
+        self._sync_file_watches()
 
     def _normalize_loaded(self, record: dict) -> dict:
         status = str(record.get("status") or "")
@@ -1906,6 +1947,116 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._scale_preview()
+
+    def _schedule_file_check(self, _path: str = "") -> None:
+        self._file_check.start(200)
+
+    def _sync_file_watches(self) -> None:
+        if not hasattr(self, "file_watcher"):
+            return
+        directories: set[str] = set()
+        files: set[str] = set()
+        root = Path(self.output_dir)
+        if root.is_dir():
+            directories.add(str(root))
+        for record in self.candidates.values():
+            for key in ("path", "approved_path"):
+                raw = str(record.get(key) or "")
+                if not raw:
+                    continue
+                file = Path(raw)
+                if file.is_file():
+                    files.add(str(file))
+                if file.parent.is_dir():
+                    directories.add(str(file.parent))
+        self._apply_watches(set(self.file_watcher.directories()), directories)
+        self._apply_watches(set(self.file_watcher.files()), files)
+
+    def _apply_watches(self, current: set[str], wanted: set[str]) -> None:
+        extra = [path for path in current if path not in wanted]
+        missing = [path for path in wanted if path not in current]
+        if extra:
+            self.file_watcher.removePaths(extra)
+        if missing:
+            self.file_watcher.addPaths(missing)
+
+    def _forget_missing_files(self) -> None:
+        gone = [
+            cid
+            for cid, record in self.candidates.items()
+            if str(record.get("path") or "") and not Path(str(record.get("path") or "")).is_file()
+        ]
+        if not gone:
+            self._sync_file_watches()
+            return
+        for cid in gone:
+            self.discarded.add(cid)
+            self._drop_record(cid)
+        self.save_manifest()
+        self._sync_file_watches()
+        if len(gone) == 1:
+            self.append_log("Removed an image that is no longer in the output folder.")
+        else:
+            self.append_log(f"Removed {len(gone)} images that are no longer in the output folder.")
+
+    def _drop_record(self, cid: str) -> None:
+        self.candidates.pop(cid, None)
+        if cid in self.order:
+            self.order.remove(cid)
+        item = self.items.pop(cid, None)
+        if item is not None:
+            row = self.gallery.row(item)
+            if row >= 0:
+                self.gallery.takeItem(row)
+        if self._selected_id() == cid or getattr(self, "_shown_id", "") == cid:
+            self.show_record(None)
+        self.refresh_totals()
+        self._review_title()
+
+    def _delete_saved_files(self, record: dict) -> str:
+        problems: list[str] = []
+        for key in ("path", "approved_path"):
+            raw = str(record.get(key) or "")
+            if not raw:
+                continue
+            file = Path(raw)
+            if not file.is_file():
+                continue
+            try:
+                file.unlink()
+            except OSError as exc:
+                problems.append(f"Could not delete {file.name}. {exc}")
+        return " ".join(problems)
+
+    def remove_selected(self) -> None:
+        record = self.current()
+        if not record:
+            return
+        raw = str(record.get("path") or "")
+        name = Path(raw).name if raw else str(record.get("product_name") or "this image")
+        approved = str(record.get("approved_path") or "")
+        extra = ""
+        if approved and Path(approved).is_file():
+            extra = " The copy in the approved folder is deleted too."
+        answer = QMessageBox.question(
+            self,
+            "Remove image",
+            f"Delete {name} from the output folder and remove it from this list?{extra} This cannot be undone.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        cid = str(record.get("id") or "")
+        self.discarded.add(cid)
+        self.engine.note_decision(cid)
+        error = self._delete_saved_files(record)
+        self._drop_record(cid)
+        self.save_manifest()
+        self._sync_file_watches()
+        if error:
+            self.append_log(error)
+            QMessageBox.warning(self, "Remove image", error)
+            return
+        self.append_log(f"Removed {name}.")
 
     def approve_selected(self) -> None:
         record = self.current()

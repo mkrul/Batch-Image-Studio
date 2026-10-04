@@ -130,6 +130,7 @@ def build_prompt(
     has_approved: bool,
     n_product: int = 0,
     n_approved: int = 0,
+    anchor: bool = False,
 ) -> str:
     parts: list[str] = []
     editing = bool(change.strip())
@@ -182,12 +183,21 @@ def build_prompt(
     elif mode == "stage":
         if editing:
             parts.append(
-                "The first image is the picture to edit. Change the product in the open center only. "
+                "The first image is the picture to edit. Change only what the change text asks for. "
+                "Keep the same product, count, scale, and placement unless that text says otherwise."
+            )
+            parts.append(
+                "Do not redesign the scene outside the open center. Those pixels will be put back after this request. "
+                "The later photographs are anatomy references. Do not replace the product with a different one drawn from them."
+            )
+        elif anchor:
+            parts.append(
+                "The first image is the scene to keep. Draw the product in the open center only. "
                 "Do not redesign the scene outside that center. Those pixels will be put back after this request."
             )
             parts.append(
-                "Images after the first include the original scene and the appearance photographs. "
-                "Draw a new product that resembles the photographs. Do not paste or copy those photographs into the scene."
+                "The last attached image is the earlier result to stay close to. "
+                "The photographs between the scene and that result are anatomy references only."
             )
         else:
             parts.append(
@@ -224,6 +234,11 @@ def build_prompt(
         )
     if editing:
         parts.append("Change to apply:\n" + change.strip())
+    if anchor and not editing:
+        parts.append(
+            "The last attached image is an earlier result. Stay close to it: same subject, count, scale, placement, and lighting. "
+            "Do not invent a different arrangement. Do not copy a reference photograph over that result."
+        )
     return "\n\n".join(parts)
 
 
@@ -456,6 +471,8 @@ class Engine(QObject):
         self._key = ""
         self.decided: set[str] = set()
         self.cap_logged = False
+        self.anchors: dict[str, str] = {}
+        self.pending_followers: list[Job] = []
 
     def set_cap(self, value: float) -> None:
         with self.money_lock:
@@ -512,13 +529,19 @@ class Engine(QObject):
         except OSError as exc:
             self._clear_starting()
             raise RuntimeError(f"Could not create the output folder. {exc}") from exc
-        jobs: list[Job] = []
+        leaders: list[Job] = []
+        followers: list[Job] = []
         pasted = [product.name for product in products if product.mode == "inset"]
         for product in products:
             workspace = output / "_workspace" / f"{context.run_id}_{product.id}"
             copies = 1 if product.mode == "inset" else max(1, int(context.candidates))
             for index in range(copies):
-                jobs.append(self._make_fresh_job(context, product, workspace, index))
+                job = self._make_fresh_job(context, product, workspace, index)
+                if index == 0 or product.mode == "inset":
+                    leaders.append(job)
+                else:
+                    followers.append(job)
+        jobs = leaders + followers
         if not jobs:
             self._clear_starting()
             self.log.emit("Nothing to generate.")
@@ -533,8 +556,10 @@ class Engine(QObject):
                 "Extra candidates would be the same paste, so they are not created."
             )
         self.busy.emit(True)
+        with self.state_lock:
+            self.pending_followers = followers
         try:
-            for job in jobs:
+            for job in leaders:
                 self._submit(job)
         finally:
             self._clear_starting()
@@ -569,6 +594,10 @@ class Engine(QObject):
         if not isinstance(meta, dict):
             self.log.emit("The saved references for this image could not be read.")
             return
+        if kind == "another":
+            parent_file = str(parent.get("path") or "")
+            if parent_file and Path(parent_file).is_file():
+                self._remember_anchor(self._anchor_key_from_workspace(workspace), parent_file, force=True)
         if str(meta.get("mode") or "") == "inset" and kind == "change":
             self.log.emit(
                 "This picture is a paste onto your scene. Change Height and generate again. "
@@ -703,6 +732,65 @@ class Engine(QObject):
             self._emit(_blank_record(job))
         pool.submit(self._execute, job)
 
+    def _anchor_key(self, job: Job) -> str:
+        if job.product is not None and job.product.id:
+            return job.product.id
+        return self._anchor_key_from_workspace(job.workspace)
+
+    def _anchor_key_from_workspace(self, workspace: str) -> str:
+        name = Path(workspace).name
+        if "_" in name:
+            return name.split("_", 1)[1]
+        return workspace or name
+
+    def _remember_anchor(self, key: str, path: str, *, force: bool = False) -> None:
+        if not key or not path:
+            return
+        with self.state_lock:
+            current = self.anchors.get(key, "")
+            if force or not current or not Path(current).is_file():
+                self.anchors[key] = path
+
+    def _note_saved(self, job: Job, dest: Path) -> None:
+        self._remember_anchor(self._anchor_key(job), str(dest), force=job.kind == "change")
+
+    def _anchor_for(self, job: Job) -> str:
+        if job.kind == "change":
+            return ""
+        if job.kind == "another":
+            path = job.parent_path
+            return path if path and Path(path).is_file() else ""
+        key = self._anchor_key(job)
+        with self.state_lock:
+            current = self.anchors.get(key, "")
+        if not current or not Path(current).is_file():
+            return ""
+        if job.kind == "retry" and job.parent_path:
+            try:
+                if Path(current).resolve() == Path(job.parent_path).resolve():
+                    return ""
+            except OSError:
+                return ""
+        return current
+
+    def _with_anchor(self, uploads: list[tuple[str, bytes, str]], anchor_path: str) -> list[tuple[str, bytes, str]]:
+        data = Path(anchor_path).read_bytes()
+        combined = [*uploads, ("anchor.png", data, "image/png")]
+        if len(combined) <= 16:
+            return combined
+        return [combined[0], *combined[1:15], combined[-1]]
+
+    def _release_followers(self, job: Job) -> None:
+        key = self._anchor_key(job)
+        with self.state_lock:
+            if self.cancel.is_set():
+                self.pending_followers = []
+                return
+            ready = [item for item in self.pending_followers if self._anchor_key(item) == key]
+            self.pending_followers = [item for item in self.pending_followers if self._anchor_key(item) != key]
+        for follower in ready:
+            self._submit(follower)
+
     def _finish(self) -> None:
         with self.state_lock:
             self.inflight = max(0, self.inflight - 1)
@@ -796,6 +884,14 @@ class Engine(QObject):
                 raise Stopped()
             meta = self._ensure_workspace(job)
             n_product, n_approved = _prompt_counts(meta)
+            uploads, mask = self._job_files(job, meta)
+            anchor_path = "" if str(meta.get("mode") or "") == "inset" else self._anchor_for(job)
+            if anchor_path:
+                uploads = self._with_anchor(uploads, anchor_path)
+                self.log.emit(
+                    f"{job.product_name}: matching the earlier result {Path(anchor_path).name} "
+                    "so this image stays close to it."
+                )
             prompt = build_prompt(
                 mode=str(meta["mode"]),
                 brief=str(meta.get("brief") or ""),
@@ -807,13 +903,13 @@ class Engine(QObject):
                 has_approved=bool(meta.get("approved_files")),
                 n_product=n_product,
                 n_approved=n_approved,
+                anchor=bool(anchor_path),
             )
             record["prompt"] = prompt
             record["model"] = str(meta.get("model") or "")
             record["mode"] = str(meta.get("mode") or "")
             record["notes"] = "\n".join(meta.get("warnings") or [])
             record["output_dir"] = str(meta.get("output_dir") or job.output_dir)
-            uploads, mask = self._job_files(job, meta)
             if str(meta.get("mode") or "") == "inset":
                 self._reconcile(job.reserve, 0.0)
                 held = False
@@ -853,6 +949,7 @@ class Engine(QObject):
                 image, scene_path = self._postprocess(job, meta, raw)
             except Exception as exc:
                 dest = self._save_bytes(job, meta, raw)
+                self._note_saved(job, dest)
                 record["path"] = str(dest)
                 record["status"] = "unreviewed"
                 record["error"] = f"Saved the generated image. The product could not be placed back onto it. {friendly(exc)}"
@@ -860,6 +957,7 @@ class Engine(QObject):
                 self.log.emit(record["error"])
                 return
             dest = self._save_visible(job, meta, image)
+            self._note_saved(job, dest)
             record["path"] = str(dest)
             record["scene_path"] = str(scene_path or "")
             will_screen = bool(meta.get("screen")) and bool(str(meta.get("criteria") or "").strip())
@@ -891,6 +989,8 @@ class Engine(QObject):
             self._emit(record)
             self.log.emit(f"{job.product_name}: {record['error']}")
         finally:
+            if job.kind == "fresh" and job.index == 0:
+                self._release_followers(job)
             self._finish()
 
     def _cap_block(self, job: Job, record: dict) -> None:
@@ -1308,7 +1408,7 @@ class Engine(QObject):
             return
         if self.cancel.is_set() or self._human_decided(job.candidate_id):
             return
-        self._submit_retry(job, meta, correction)
+        self._submit_retry(job, meta, correction, str(record.get("path") or ""))
 
     def _screen(self, meta: dict, record: dict) -> tuple[bool, list[str], str, float]:
         criteria = str(meta.get("criteria") or "").strip()
@@ -1396,7 +1496,7 @@ class Engine(QObject):
                 return client.responses.create(**reduced)
             raise
 
-    def _submit_retry(self, job: Job, meta: dict, correction: str) -> None:
+    def _submit_retry(self, job: Job, meta: dict, correction: str, rejected_path: str) -> None:
         reserve = estimate_image_call(
             str(meta.get("quality") or "high"),
             str(meta.get("size") or "1024x1024"),
@@ -1413,7 +1513,7 @@ class Engine(QObject):
             source_id=job.candidate_id,
             correction=_combine_corrections(job.correction, correction),
             change="",
-            parent_path="",
+            parent_path=rejected_path,
             scene_path="",
             reserve=reserve,
             announce=True,
