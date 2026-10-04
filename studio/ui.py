@@ -1169,10 +1169,7 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.reject_button)
         side.addLayout(actions)
         side.addWidget(another)
-        side.addWidget(muted(
-            "This asks for a new image from the original brief. The selected image is attached only as the look to stay close to. "
-            "It is not a chat, and the rejected pictures are still left out."
-        ))
+        side.addWidget(muted("This asks for a new image with the original brief and references. It does not attach the selected image."))
         self.change_text = PlainText()
         self.change_text.setFixedHeight(70)
         self.change_text.setPlaceholderText("Describe one change to the selected image. The original brief stays in the request.")

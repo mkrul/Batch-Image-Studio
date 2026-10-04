@@ -50,15 +50,15 @@ Clear prompt, Clear references, and Clear images remove those items from the win
 
 In ChatGPT, the next image is part of the same conversation. The app rewrites the prompt and can edit the previous picture. Each turn conditions on what came before, so the result walks away from the first brief.
 
-This program uses the Image API, not a conversation. Every candidate is sent alone, with the original prompt and the original reference images. A rejected image is not attached to the retry. The retry repeats the original brief and the corrections collected so far. A change you type edits only the image you selected, together with the original brief. It does not accumulate a session of earlier pictures. Edits request high fidelity to the supplied images. GPT Image 2 ignores that setting. If a model rejects the setting, the same request is sent again without it.
+This program uses the Image API, not a conversation. Every candidate is sent alone, with the original prompt and the original reference images. A rejected image is not attached to the retry. The retry repeats the original brief and the corrections collected so far. A change you type edits only the image you selected, together with the original brief. It does not accumulate a session of earlier pictures. Edits request high fidelity to the supplied images, except Generate product in my scene, which leaves that setting off so the open center can be drawn. GPT Image 2 ignores that setting. If a model rejects the setting, the same request is sent again without it.
 
-Independent requests do not make the images identical. The model still samples, so the candidates differ. The brief stays fixed.
+Independent requests do not make the images identical. The model still samples, so the candidates differ. The brief stays fixed. A previous result is not attached to the next request.
 
 ## Review and retries
 
 Turn on review to send each finished image to a vision model with your criteria. The default reviewer is GPT-5.4. GPT-5.4 mini costs less and is less careful.
 
-The reviewer can miss a bad label, a wrong color, or a detail you dislike. It can also reject an image you would have kept. The Review tab is the decision. Approve copies the file into `approved` inside the output folder. Reject leaves the file where it is.
+The reviewer can miss a bad label, a wrong color, or a detail you dislike. It can also reject an image you would have kept. The Review tab is the decision. Approve copies the file into `approved` inside the output folder. Reject leaves the file where it is. Remove image deletes the generated file and the approved copy, and removes that row. Deleting the generated file in Finder removes the row as well. Text typed in Review notes is saved on that image.
 
 A rejection can request another image, up to the retry limit. The new request repeats the original brief and every correction so far. It does not include the rejected picture. Retries stop when the limit or the spend cap is reached. If you approve or reject an image while the reviewer is still working, that decision stands and no automatic retry is sent. Use my scene, paste product does not request another image after a rejection, because the next paste would be the same picture.
 
