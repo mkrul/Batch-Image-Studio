@@ -4,7 +4,7 @@ A Mac window for generating many images through the OpenAI API. Each image is a 
 
 ## Open it
 
-Double-click `Batch Image Studio` on the Desktop. A Terminal window opens, and then the program window opens. The Finder and Dock icon is the blue image with the product cards.
+Double-click `Batch Image Studio` on the Desktop. A Terminal window opens, and then the program window opens. That Terminal window stays open while the program is running. Quitting the program closes it. Closing the Terminal window does not quit the program. The Finder and Dock icon is the blue image with the product cards.
 
 The program files stay in the `batch-img-creation` folder, which is also on the Desktop. Leave that folder where it is. The Desktop app starts the program from there.
 
@@ -17,6 +17,8 @@ You can also start it from Terminal, in this folder:
 ```bash
 .venv/bin/python -m studio
 ```
+
+That Terminal window is yours. Quitting the program does not close it. Dark theme, beside the title, switches the window colors. The choice is saved with the other settings.
 
 ## API key
 
@@ -58,7 +60,7 @@ Turn on review to send each finished image to a vision model with your criteria.
 
 The reviewer can miss a bad label, a wrong color, or a detail you dislike. It can also reject an image you would have kept. The Review tab is the decision. Approve copies the file into `approved` inside the output folder. Reject leaves the file where it is.
 
-A rejection can request another image, up to the retry limit. The new request repeats the original brief and every correction so far. It does not include the rejected picture. Retries stop when the limit or the spend cap is reached. If you approve or reject an image while the reviewer is still working, that decision stands and no automatic retry is sent.
+A rejection can request another image, up to the retry limit. The new request repeats the original brief and every correction so far. It does not include the rejected picture. Retries stop when the limit or the spend cap is reached. If you approve or reject an image while the reviewer is still working, that decision stands and no automatic retry is sent. Use my scene, paste product does not request another image after a rejection, because the next paste would be the same picture.
 
 Generate another from the original brief asks for a new image from the saved brief and references. Apply a change to this image edits the selected file and keeps the original brief in the request.
 
@@ -71,6 +73,8 @@ Lock product pixels is for a product that should stay in its original frame. Cre
 The photograph may be resized to a size the API accepts. The pixels that are pasted are that resized photograph, not a new drawing of the product. Lock mode does not use the size menu. It keeps the photograph's frame. It cannot move or recolor the product. Use Reference only if the product itself must change.
 
 New scene, paste product asks the model for a scene and tells it not to draw the product. The product photographs are not sent to the image model. The program then pastes your cutout on the lower center. The reviewer still receives the cutout and the product photographs, so it can compare the finished picture with the real product. This requires a PNG that already has transparency, or a cutout you create in the product card. The scale is the product height as a fraction of the frame. A later change edits the scene and pastes the same cutout again. It does not redraw the product. A correction cannot move that pasted product. Change the height scale and generate again when the product sits in the wrong place.
+
+Use my scene, paste product is for a scene you already have. Drop that scene into Reference images. The first image is kept and is not redrawn. Create a cutout on the product card. Height is the product height as a fraction of that scene. 0.62 means 62 percent of the scene height. The product is centered and sits near the bottom. If it would be wider than about 86 percent of the frame, it is shrunk. The image model is not called, and one picture is saved per product. A text correction cannot move the product. Change Height and generate again. If review is off, this mode does not need an API key. If review is on, the reviewer still calls the API.
 
 Cut out plain background is for a product on a plain backdrop. It only changes transparency. Check the checkerboard preview. Cut out complex background uses the optional local `rembg` model and does not send the photograph to OpenAI. Install it with:
 
@@ -90,13 +94,13 @@ Image calls are counted at the published GPT Image 2.5 rates: $5 per million tex
 
 The cap stops new requests. One request that is already in flight can finish after the cap is reached. Stop cancels work that has not been sent. A request that has already reached OpenAI still finishes and is saved.
 
-High, xhigh, and max quality, large sizes, reference images, review, and retries are what make a batch expensive. Start with a small candidate count.
+High, xhigh, and max quality, large sizes, reference images, review, and retries are what make a batch expensive. Start with a small candidate count. Use my scene, paste product does not send an image request. Review of that picture is still billed when review is on.
 
 ## Files
 
 Generated images go in the output folder, under a folder named for the product. `approved` holds the copies you accept. `manifest.json` is the review list. `_workspace` holds the reference copies used for a later change. You can delete `_workspace` after you no longer need changes or retries for that run. `log.txt` is the activity log.
 
-Settings, other than the API key, are stored in `~/Library/Application Support/BatchImageStudio`.
+Settings, other than the API key, are stored in `~/Library/Application Support/BatchImageStudio`. That includes the dark theme choice.
 
 ## Limits
 
