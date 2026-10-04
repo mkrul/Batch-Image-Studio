@@ -33,6 +33,7 @@ MODES = [
     ("reference", "Reference only"),
     ("lock", "Lock product pixels"),
     ("composite", "New scene, paste product"),
+    ("inset", "Use my scene, paste product"),
 ]
 
 QUALITIES_CURRENT = ["low", "medium", "high", "xhigh", "max"]
@@ -52,6 +53,7 @@ MODE_HELP = {
     "reference": "The model creates the whole image. It can redraw the product.",
     "lock": "The product stays in its original frame. After the model renders the scene, the original product pixels are put back. Create a cutout or choose a mask first.",
     "composite": "The model renders a scene and does not render the product. The program pastes your cutout onto the lower center. Use a PNG with transparency, or create a cutout first.",
+    "inset": "The first image in Reference images is your scene. It is not redrawn. The program pastes your cutout on the lower center at Height. The image model does not draw the product.",
 }
 
 

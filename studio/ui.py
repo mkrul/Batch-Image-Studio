@@ -566,6 +566,7 @@ class ProductCard(QFrame):
         self.scale.setSingleStep(0.05)
         self.scale.setValue(0.62)
         self.scale.setPrefix("Height ")
+        self.scale.setToolTip("How tall the pasted product is, compared with the picture. 0.62 means 62 percent of the height.")
         mode_row.addWidget(self.scale)
         layout.addLayout(mode_row)
         self.mode_help = muted(MODE_HELP["reference"])
@@ -641,7 +642,7 @@ class ProductCard(QFrame):
     def _mode_changed(self, _index: int = 0) -> None:
         mode = self.mode.currentData()
         self.mode_help.setText(MODE_HELP.get(mode, ""))
-        self.scale.setVisible(mode == "composite")
+        self.scale.setVisible(mode in {"composite", "inset"})
         self.changed.emit()
 
     def _choose_mask(self) -> None:
@@ -975,6 +976,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(section("Reference images"))
         layout.addWidget(muted(
             "Drop one approved example here. Every product uses it for lighting, framing, and background. "
+            "For Use my scene, paste product, the first image here is the scene you already have. It is not redrawn. "
             "Leave the product list empty to generate from this prompt and these images only."
         ))
         self.references = ImageDrop("Drop the approved example, or any shared reference images.")
@@ -1391,13 +1393,7 @@ class MainWindow(QMainWindow):
     def on_generate(self) -> None:
         if self.engine.is_busy():
             return
-        if not load_api_key():
-            QMessageBox.warning(self, "API key", "Save an API key first. It is stored in .env in this project folder.")
-            return
         brief = self.prompt.toPlainText().strip()
-        if not brief:
-            QMessageBox.warning(self, "Prompt", "Write a prompt first.")
-            return
         products = [card.spec() for card in self.cards]
         if not products:
             products = [
@@ -1416,24 +1412,38 @@ class MainWindow(QMainWindow):
         if problems:
             QMessageBox.warning(self, "Generate", problems)
             return
+        review_on = self.screen_box.isChecked() and bool(self.criteria.toPlainText().strip())
+        generates = any(product.mode != "inset" for product in products)
+        if (generates or review_on) and not load_api_key():
+            QMessageBox.warning(self, "API key", "Save an API key first. It is stored in .env in this project folder.")
+            return
+        if generates and not brief:
+            QMessageBox.warning(self, "Prompt", "Write a prompt first.")
+            return
         context = self._context(brief)
         cap = float(self.cap_spin.value())
         n_approved = len(context.approved_paths)
         wave = 0.0
+        ceiling = 0.0
         largest = 0.0
+        job_count = 0
         for product in products:
             incoming = self._input_count(product, n_approved)
             size = context.size
+            copies = 1 if product.mode == "inset" else context.candidates
+            job_count += copies
             if product.mode == "lock" and product.image_paths:
                 try:
                     size = locked_output_size(Path(product.image_paths[0]))
                 except Exception:
                     size = context.size
-            image_cost = estimate_image_call(context.quality, size, incoming)
+            image_cost = 0.0 if product.mode == "inset" else estimate_image_call(context.quality, size, incoming)
             screen_images = 1 + min(4, len(product.image_paths)) + min(2, n_approved)
             review_cost = estimate_screen_call(context.screen_model, screen_images) if context.screen and context.criteria.strip() else 0
-            largest = max(largest, image_cost)
-            wave += context.candidates * (image_cost + review_cost)
+            largest = max(largest, image_cost + review_cost)
+            wave += copies * (image_cost + review_cost)
+            extra = 0 if product.mode == "inset" else context.retries
+            ceiling += copies * (image_cost + review_cost) * (1 + extra)
         if largest > cap:
             QMessageBox.warning(
                 self,
@@ -1442,17 +1452,22 @@ class MainWindow(QMainWindow):
                 "Raise the cap, or choose a lower quality or a smaller size.",
             )
             return
-        retries = context.retries
-        ceiling = wave * (1 + retries)
         screen_line = "Review is on." if context.screen and context.criteria.strip() else "Review is off, or the criteria box is empty. Nothing will be rejected automatically."
+        paste_line = ""
+        if any(product.mode == "inset" for product in products):
+            paste_line = (
+                "Use my scene, paste product does not send an image request. "
+                "One picture is saved for each of those products, using the first reference image as the scene.\n"
+            )
         answer = QMessageBox.question(
             self,
             "Generate images",
             (
-                f"This can request up to {len(products) * context.candidates} images before retries.\n"
+                f"This can create up to {job_count} images before retries.\n"
                 f"Allowance held before retries and review settle: about {money(wave)}.\n"
-                f"If every image uses every retry, the allowance could reach about {money(ceiling)}.\n"
+                f"If every generated image uses every retry, the allowance could reach about {money(ceiling)}.\n"
                 f"The cap is {money(cap)}. The run stops when the cap is reached.\n"
+                f"{paste_line}"
                 f"{screen_line}\n"
                 "The reviewer can miss errors. Approve the images yourself.\n"
                 "The OpenAI invoice is the authority. API use is billed separately from ChatGPT."
@@ -1477,6 +1492,8 @@ class MainWindow(QMainWindow):
                 problems.extend(self._lock_problems(product))
             elif product.mode == "composite":
                 problems.extend(self._composite_problems(product))
+            elif product.mode == "inset":
+                problems.extend(self._inset_problems(product))
         if len(problems) > 12:
             hidden = len(problems) - 12
             problems = problems[:12]
@@ -1538,7 +1555,18 @@ class MainWindow(QMainWindow):
             run_id=uuid.uuid4().hex[:8],
         )
 
+    def _inset_problems(self, product: ProductSpec) -> list[str]:
+        problems: list[str] = []
+        if not self.references.paths:
+            problems.append(
+                f"{product.name}: drop the scene you already have into Reference images. The first image is the one that is kept."
+            )
+        problems.extend(self._composite_problems(product))
+        return problems
+
     def _input_count(self, product: ProductSpec, n_approved: int) -> int:
+        if product.mode == "inset":
+            return 0
         if product.mode == "composite":
             return min(16, n_approved)
         return min(16, len(product.image_paths) + n_approved)
@@ -1718,6 +1746,8 @@ class MainWindow(QMainWindow):
             self.change_text.setPlaceholderText("This can change the scene. The product pixels stay in place.")
         elif mode == "composite":
             self.change_text.setPlaceholderText("This changes the scene. The product is pasted again and is not redrawn. Scale stays as it was.")
+        elif mode == "inset":
+            self.change_text.setPlaceholderText("This picture is a paste. Change Height and generate again. A text change cannot move the product.")
         else:
             self.change_text.setPlaceholderText("Describe one change. The original brief stays in the request.")
 

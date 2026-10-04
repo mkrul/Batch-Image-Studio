@@ -172,6 +172,10 @@ def build_prompt(
                 "The attached images are the approved example for lighting, framing, and background. "
                 "Match that lighting and setting. Do not copy a product out of them."
             )
+    elif mode == "inset":
+        parts.append(
+            "The scene already exists and must stay as it is. Do not draw a new scene or a new product."
+        )
     elif has_product and has_approved:
         parts.append(
             "Product photographs define the product's shape, color, label, and geometry. "
@@ -405,9 +409,11 @@ class Engine(QObject):
             self._clear_starting()
             raise RuntimeError(f"Could not create the output folder. {exc}") from exc
         jobs: list[Job] = []
+        pasted = [product.name for product in products if product.mode == "inset"]
         for product in products:
             workspace = output / "_workspace" / f"{context.run_id}_{product.id}"
-            for index in range(max(1, int(context.candidates))):
+            copies = 1 if product.mode == "inset" else max(1, int(context.candidates))
+            for index in range(copies):
                 jobs.append(self._make_fresh_job(context, product, workspace, index))
         if not jobs:
             self._clear_starting()
@@ -417,6 +423,11 @@ class Engine(QObject):
             f"Starting {len(products)} product run(s), {len(jobs)} candidate(s). "
             f"Model {context.model}. Quality {context.quality}. Size {context.size}."
         )
+        if pasted and int(context.candidates) > 1:
+            self.log.emit(
+                "Use my scene, paste product saves one picture per product. "
+                "Extra candidates would be the same paste, so they are not created."
+            )
         self.busy.emit(True)
         try:
             for job in jobs:
@@ -454,6 +465,12 @@ class Engine(QObject):
         if not isinstance(meta, dict):
             self.log.emit("The saved references for this image could not be read.")
             return
+        if str(meta.get("mode") or "") == "inset" and kind == "change":
+            self.log.emit(
+                "This picture is a paste onto your scene. Change Height and generate again. "
+                "A text change cannot move the product."
+            )
+            return
         if kind == "change" and str(meta.get("mode") or "") == "composite":
             if not Path(str(parent.get("scene_path") or "")).is_file():
                 self.log.emit("The scene file is missing, so the product cannot be pasted again.")
@@ -465,11 +482,14 @@ class Engine(QObject):
         if not isinstance(uploads, list):
             uploads = []
         extra = 1 if kind == "change" else 0
-        reserve = estimate_image_call(
-            str(meta.get("quality") or "high"),
-            str(meta.get("size") or "1024x1024"),
-            len(uploads) + extra,
-        )
+        if str(meta.get("mode") or "") == "inset":
+            reserve = 0.0
+        else:
+            reserve = estimate_image_call(
+                str(meta.get("quality") or "high"),
+                str(meta.get("size") or "1024x1024"),
+                len(uploads) + extra,
+            )
         job = Job(
             candidate_id=_new_id(),
             kind=kind,
@@ -494,15 +514,23 @@ class Engine(QObject):
     def _make_fresh_job(self, context: RunContext, product: ProductSpec, workspace: Path, index: int) -> Job:
         if product.mode == "composite":
             images = len(context.approved_paths)
+        elif product.mode == "inset":
+            images = 0
         else:
             images = len(product.image_paths) + len(context.approved_paths)
         size = context.size
+        if product.mode == "inset" and context.approved_paths:
+            try:
+                scene = load_rgba(Path(context.approved_paths[0]))
+                size = f"{scene.width}x{scene.height}"
+            except Exception:
+                size = context.size
         if product.mode == "lock" and product.image_paths:
             try:
                 size = locked_output_size(Path(product.image_paths[0]))
             except Exception:
                 size = context.size
-        reserve = estimate_image_call(context.quality, size, min(16, images))
+        reserve = 0.0 if product.mode == "inset" else estimate_image_call(context.quality, size, min(16, images))
         return Job(
             candidate_id=_new_id(),
             kind="fresh",
@@ -667,6 +695,35 @@ class Engine(QObject):
             record["notes"] = "\n".join(meta.get("warnings") or [])
             record["output_dir"] = str(meta.get("output_dir") or job.output_dir)
             uploads, mask = self._job_files(job, meta)
+            if str(meta.get("mode") or "") == "inset":
+                self._reconcile(job.reserve, 0.0)
+                held = False
+                record["cost"] = 0.0
+                record["prompt"] = (
+                    "The image model was not called. The cutout was pasted onto the first reference image. "
+                    f"Height {float(meta.get('scale') or 0.62):.2f} of that scene."
+                )
+                try:
+                    image = self._paste_supplied_scene(Path(job.workspace), meta)
+                except Exception as exc:
+                    record["status"] = "error"
+                    record["error"] = friendly(exc)
+                    self._emit(record)
+                    self.log.emit(f"{job.product_name}: {record['error']}")
+                    return
+                dest = self._save_visible(job, meta, image)
+                record["path"] = str(dest)
+                will_screen = bool(meta.get("screen")) and bool(str(meta.get("criteria") or "").strip())
+                record["status"] = "reviewing" if will_screen else "unreviewed"
+                self._emit(record)
+                self.log.emit(f"Pasted {dest.name} for {record['product_name']} onto your scene.")
+                if will_screen and not self.cancel.is_set():
+                    self._screen_and_maybe_retry(job, meta, record)
+                elif self.cancel.is_set() and record["status"] == "reviewing":
+                    record["status"] = "unreviewed"
+                    record["error"] = "Saved. Stopped before review."
+                    self._emit(record)
+                return
             raw, actual, request_id = self._generate(meta, prompt, uploads, mask)
             self._reconcile(job.reserve, job.reserve if actual is None else actual)
             held = False
@@ -821,6 +878,28 @@ class Engine(QObject):
             warnings.append(
                 f"{product.name}: the scene is generated without the product. The cutout is pasted on afterward, so the product pixels are the photograph."
             )
+        elif mode == "inset":
+            if not context.approved_paths:
+                raise RuntimeError(f"{product.name}: drop the scene you already have into Reference images.")
+            scene = load_rgba(Path(context.approved_paths[0]))
+            sprite = self._sprite(product)
+            cutout_name = "cutout.png"
+            scene_name = "supplied_scene.png"
+            (workspace / cutout_name).write_bytes(png_bytes(sprite))
+            (workspace / scene_name).write_bytes(png_bytes(scene))
+            product_files.append(cutout_name)
+            for index, path in enumerate(product.image_paths, start=1):
+                if product.cutout_path and Path(path).resolve() == Path(product.cutout_path).resolve():
+                    continue
+                product_files.append(self._store_reference(workspace, f"product_{index:02d}", Path(path)))
+            approved_files.append(scene_name)
+            size = f"{scene.width}x{scene.height}"
+            if len(context.approved_paths) > 1:
+                warnings.append(f"{product.name}: only the first reference image is used as the scene.")
+            warnings.append(
+                f"{product.name}: your scene is kept. The cutout is pasted at height {float(product.scale):.2f}. "
+                "The image model is not asked to draw the scene or the product."
+            )
         else:
             for path in product.image_paths:
                 product_files.append(self._store_reference(workspace, f"upload_{len(uploads):02d}", Path(path)))
@@ -864,6 +943,11 @@ class Engine(QObject):
         }
         atomic_write(workspace / "meta.json", json.dumps(meta, indent=2))
         return meta
+
+    def _paste_supplied_scene(self, workspace: Path, meta: dict) -> Image.Image:
+        scene = load_rgba(workspace / "supplied_scene.png")
+        cutout = load_rgba(workspace / str(meta.get("cutout") or "cutout.png"))
+        return composite_product(scene, cutout, float(meta.get("scale") or 0.62))
 
     def _sprite(self, product: ProductSpec) -> Image.Image:
         if product.cutout_path:
@@ -1052,6 +1136,12 @@ class Engine(QObject):
         self._emit(record)
         detail = "; ".join(issues) if issues else "the reviewer rejected it"
         self.log.emit(f"Reviewer rejected {record['product_name']}: {detail}")
+        if str(meta.get("mode") or "") == "inset":
+            self.log.emit(
+                f"{record['product_name']}: this picture is a paste, so a rejection does not request another image. "
+                "Change Height and generate again."
+            )
+            return
         retries = int(meta.get("retries") or 0)
         if job.attempt >= retries:
             self.log.emit(f"Retry limit reached for {record['product_name']}.")
