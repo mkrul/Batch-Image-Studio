@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import threading
 import time
 import uuid
@@ -297,6 +298,63 @@ def _screen_text(
     )
     lines.append("Do not ask for a new style or a new idea.")
     return "\n".join(lines)
+
+
+_RETRY_AFTER = re.compile(
+    r"try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|milliseconds|s|sec|secs|seconds|m|min|mins|minutes)?",
+    re.IGNORECASE,
+)
+_LIMIT_NUMS = re.compile(
+    r"Limit\s+([0-9][0-9,]*)\s*,\s*Used\s+([0-9][0-9,]*)\s*,\s*Requested\s+([0-9][0-9,]*)",
+    re.IGNORECASE,
+)
+_LIMIT_KIND = re.compile(r"\bon\s+([^:]{1,80}):", re.IGNORECASE)
+
+
+def _seconds_from_text(text: str) -> float | None:
+    match = _RETRY_AFTER.search(text or "")
+    if not match:
+        return None
+    value = float(match.group(1))
+    unit = (match.group(2) or "s").lower()
+    if unit.startswith("ms") or unit.startswith("mill"):
+        value /= 1000.0
+    elif unit.startswith("m"):
+        value *= 60.0
+    return value
+
+
+def _rate_limit_facts(exc: RateLimitError) -> tuple[str, float, bool]:
+    chunks = [str(exc)]
+    response = getattr(exc, "response", None)
+    if response is not None:
+        header = str(response.headers.get("retry-after") or "").strip()
+        if header.replace(".", "", 1).isdigit():
+            chunks.append(f"try again in {header}s")
+    text = " ".join(chunks)
+    delay = _seconds_from_text(text)
+    if delay is None:
+        delay = 60.0
+    delay = min(90.0, max(1.0, delay + 1.0))
+    detail = "OpenAI refused this request because the account limit for this minute is already used."
+    too_big = False
+    nums = _LIMIT_NUMS.search(text)
+    if nums:
+        limit = int(nums.group(1).replace(",", ""))
+        used = int(nums.group(2).replace(",", ""))
+        requested = int(nums.group(3).replace(",", ""))
+        kind = "units"
+        kind_match = _LIMIT_KIND.search(text)
+        if kind_match:
+            kind = " ".join(kind_match.group(1).split())
+        detail = (
+            f"OpenAI refused this request. The account allows {limit:,} {kind}, "
+            f"{used:,} are already used, and this request needs {requested:,}."
+        )
+        if requested > limit:
+            too_big = True
+            detail += " This one request is larger than that limit, so waiting will not make it fit."
+    return detail, delay, too_big
 
 
 def friendly(exc: Exception) -> str:
@@ -703,7 +761,15 @@ class Engine(QObject):
                 raise Stopped()
             try:
                 return fn()
-            except (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError) as exc:
+            except RateLimitError as exc:
+                detail, wait, too_big = _rate_limit_facts(exc)
+                if too_big or attempt == 4:
+                    self.log.emit(detail)
+                    raise
+                self.log.emit(f"{detail} Waiting {wait:.0f}s, then sending this same request again.")
+                if not self._sleep(wait):
+                    raise Stopped() from exc
+            except (APITimeoutError, APIConnectionError, InternalServerError) as exc:
                 if attempt == 4:
                     raise
                 self.log.emit(f"The API was busy ({exc.__class__.__name__}). Waiting {delay:.0f}s, then sending this same request again.")

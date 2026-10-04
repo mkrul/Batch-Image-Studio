@@ -348,6 +348,47 @@ def section(text: str) -> QLabel:
     return label
 
 
+def _keyboard_selected(widget: QWidget) -> bool:
+    focus = QApplication.focusWidget()
+    return focus is not None and (focus is widget or widget.isAncestorOf(focus))
+
+
+class ComboBox(QComboBox):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:
+        if self.view().isVisible():
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
+class SpinBox(QSpinBox):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:
+        if _keyboard_selected(self):
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
+class DoubleSpinBox(QDoubleSpinBox):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:
+        if _keyboard_selected(self):
+            super().wheelEvent(event)
+            return
+        event.ignore()
+
+
 def narrow_combo(combo: QComboBox) -> None:
     combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     combo.setMinimumContentsLength(14)
@@ -555,13 +596,13 @@ class ProductCard(QFrame):
         self.notes.setFixedHeight(52)
         layout.addWidget(self.notes)
         mode_row = QHBoxLayout()
-        self.mode = QComboBox()
+        self.mode = ComboBox()
         for value, label in MODES:
             self.mode.addItem(label, value)
         narrow_combo(self.mode)
         self.mode.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode, 1)
-        self.scale = QDoubleSpinBox()
+        self.scale = DoubleSpinBox()
         self.scale.setRange(0.2, 0.9)
         self.scale.setSingleStep(0.05)
         self.scale.setValue(0.62)
@@ -588,7 +629,7 @@ class ProductCard(QFrame):
         layout.addLayout(buttons)
         tolerance_row = QHBoxLayout()
         tolerance_row.addWidget(QLabel("Background tolerance"))
-        self.tolerance = QSpinBox()
+        self.tolerance = SpinBox()
         self.tolerance.setRange(8, 80)
         self.tolerance.setValue(34)
         tolerance_row.addWidget(self.tolerance)
@@ -877,10 +918,10 @@ class MainWindow(QMainWindow):
         form.addLayout(key_buttons)
         form.addWidget(muted("The key is written to .env in this project folder. It is not shown again after you save it."))
         form.addWidget(section("Generation"))
-        self.model = QComboBox()
-        self.quality = QComboBox()
-        self.size = QComboBox()
-        self.background = QComboBox()
+        self.model = ComboBox()
+        self.quality = ComboBox()
+        self.size = ComboBox()
+        self.background = ComboBox()
         for value, label in BACKGROUNDS:
             self.background.addItem(label, value)
         narrow_combo(self.background)
@@ -895,16 +936,16 @@ class MainWindow(QMainWindow):
         fields.addRow("Quality", self.quality)
         fields.addRow("Size", self.size)
         fields.addRow("Background", self.background)
-        self.candidates_spin = QSpinBox()
+        self.candidates_spin = SpinBox()
         self.candidates_spin.setRange(1, 8)
         self.candidates_spin.setValue(4)
-        self.parallel_spin = QSpinBox()
+        self.parallel_spin = SpinBox()
         self.parallel_spin.setRange(1, 8)
         self.parallel_spin.setValue(2)
-        self.retries_spin = QSpinBox()
+        self.retries_spin = SpinBox()
         self.retries_spin.setRange(0, 3)
         self.retries_spin.setValue(1)
-        self.cap_spin = QSpinBox()
+        self.cap_spin = SpinBox()
         self.cap_spin.setRange(1, 500)
         self.cap_spin.setValue(10)
         self.cap_spin.setPrefix("$")
@@ -920,7 +961,7 @@ class MainWindow(QMainWindow):
         self.send_criteria = QCheckBox("Send the criteria to the image model")
         self.send_criteria.setChecked(True)
         form.addWidget(self.send_criteria)
-        self.screen_model = QComboBox()
+        self.screen_model = ComboBox()
         fill_combo(self.screen_model, SCREEN_MODELS, SCREEN_MODELS[0][0])
         form.addWidget(QLabel("Review model"))
         form.addWidget(self.screen_model)
@@ -1025,7 +1066,7 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(page)
         layout.setContentsMargins(0, 8, 0, 0)
         left = QVBoxLayout()
-        self.filter = QComboBox()
+        self.filter = ComboBox()
         narrow_combo(self.filter)
         self.filter.addItem("All", "all")
         self.filter.addItem("In progress", "progress")
