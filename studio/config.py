@@ -50,8 +50,8 @@ When an approved example is attached, fail the image if the lighting, framing, o
 
 MODE_HELP = {
     "reference": "The model creates the whole image. It can redraw the product.",
-    "lock": "The product stays in its original frame. After the model paints the scene, the original product pixels are put back. Create a cutout or choose a mask first.",
-    "composite": "The model paints a scene and does not paint the product. The program pastes your cutout onto the lower center. Use a PNG with transparency, or create a cutout first.",
+    "lock": "The product stays in its original frame. After the model renders the scene, the original product pixels are put back. Create a cutout or choose a mask first.",
+    "composite": "The model renders a scene and does not render the product. The program pastes your cutout onto the lower center. Use a PNG with transparency, or create a cutout first.",
 }
 
 
@@ -91,6 +91,7 @@ def default_settings() -> dict:
         "screen_model": SCREEN_MODELS[0][0],
         "output_dir": default_output(),
         "geometry": "",
+        "theme": "light",
     }
 
 

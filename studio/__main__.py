@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication
 
-from .ui import STYLESHEET, MainWindow
+from .ui import MainWindow, apply_theme
 
 ICON_PATH = Path(__file__).resolve().parent / "icon.png"
 
@@ -16,7 +16,7 @@ def main() -> None:
     app.setApplicationName("Batch Image Studio")
     app.setApplicationDisplayName("Batch Image Studio")
     app.setStyle("Fusion")
-    app.setStyleSheet(STYLESHEET)
+    apply_theme("light")
     icon = QIcon(str(ICON_PATH))
     if not icon.isNull():
         app.setWindowIcon(icon)

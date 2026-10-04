@@ -10,7 +10,7 @@ from pathlib import Path
 
 from PIL import Image
 from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QImageReader, QKeySequence, QPixmap, QShortcut
+from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QImageReader, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -59,103 +60,171 @@ from .engine import Engine, ProductSpec, RunContext
 from .imaging import checker_preview, is_cutout, list_images, load_rgba, locked_output_size, safe_slug
 from .pricing import estimate_image_call, estimate_screen_call, money
 
-STYLESHEET = """
-QWidget { color: #1c1c1e; font-size: 13px; background: transparent; }
-QMainWindow, QWidget#root, QWidget#settings { background: #f2f2f7; }
-QWidget#work, QListWidget#gallery, QPlainTextEdit#log {
-    background: #ffffff;
-    border: 1px solid #d1d1d6;
+def _stylesheet(colors: dict[str, str]) -> str:
+    return f"""
+QWidget {{ color: {colors["text"]}; font-size: 13px; background: transparent; }}
+QMainWindow, QWidget#root, QWidget#settings {{ background: {colors["page"]}; }}
+QWidget#work, QListWidget#gallery, QPlainTextEdit#log {{
+    background: {colors["panel"]};
+    border: 1px solid {colors["panel_border"]};
     border-radius: 12px;
-}
-QLabel#title { color: #1c1c1e; font-size: 20px; font-weight: 600; }
-QLabel#section { color: #1c1c1e; font-size: 15px; font-weight: 600; padding-top: 10px; }
-QLabel#activity, QLabel#status { color: #1c1c1e; font-weight: 600; }
-QLabel#muted { color: #1c1c1e; }
-QLabel#warning { color: #9f1239; font-weight: 600; }
-QFrame#card {
-    background: #ffffff;
-    border: 1px solid #8e8e93;
+}}
+QLabel#title {{ color: {colors["text"]}; font-size: 20px; font-weight: 600; }}
+QLabel#section {{ color: {colors["text"]}; font-size: 15px; font-weight: 600; padding-top: 10px; }}
+QLabel#activity, QLabel#status {{ color: {colors["text"]}; font-weight: 600; }}
+QLabel#muted {{ color: {colors["text"]}; }}
+QLabel#warning {{ color: {colors["warning"]}; font-weight: 600; }}
+QFrame#card {{
+    background: {colors["panel"]};
+    border: 1px solid {colors["card_border"]};
     border-radius: 10px;
-}
-QFrame#drop {
-    background: #f2f2f7;
-    border: 1px dashed #636366;
+}}
+QFrame#drop {{
+    background: {colors["drop"]};
+    border: 1px dashed {colors["drop_border"]};
     border-radius: 10px;
-}
-QFrame#drop QLabel { color: #1c1c1e; }
-QFrame#drop[active="true"] {
-    border: 2px solid #0a64d8;
-    background: #ffffff;
-}
-QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
-    background: #ffffff;
-    color: #1c1c1e;
-    border: 1px solid #636366;
+}}
+QFrame#drop QLabel {{ color: {colors["text"]}; }}
+QFrame#drop[active="true"] {{
+    border: 2px solid {colors["accent"]};
+    background: {colors["panel"]};
+}}
+QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
+    background: {colors["field"]};
+    color: {colors["text"]};
+    border: 1px solid {colors["field_border"]};
     border-radius: 6px;
     padding: 6px 8px;
     min-height: 22px;
-    selection-background-color: #0a64d8;
+    selection-background-color: {colors["accent"]};
     selection-color: #ffffff;
-}
-QPlainTextEdit#log { padding: 8px; }
-QComboBox QAbstractItemView {
-    background: #ffffff;
-    color: #1c1c1e;
-    selection-background-color: #0a64d8;
+}}
+QPlainTextEdit#log {{ padding: 8px; }}
+QComboBox QAbstractItemView {{
+    background: {colors["field"]};
+    color: {colors["text"]};
+    selection-background-color: {colors["accent"]};
     selection-color: #ffffff;
-}
-QCheckBox { color: #1c1c1e; spacing: 8px; }
-QPushButton {
-    background: #ffffff;
-    color: #1c1c1e;
-    border: 1px solid #1c1c1e;
+}}
+QCheckBox {{ color: {colors["text"]}; spacing: 8px; }}
+QPushButton {{
+    background: {colors["button"]};
+    color: {colors["text"]};
+    border: 1px solid {colors["button_border"]};
     border-radius: 6px;
     padding: 7px 12px;
     min-height: 22px;
-}
-QPushButton:hover { background: #f2f2f7; }
-QPushButton:disabled {
-    background: #f2f2f7;
-    color: #3a3a3c;
-    border: 1px solid #aeaeb2;
-}
-QPushButton#primary {
-    background: #0a64d8;
+}}
+QPushButton:hover {{ background: {colors["button_hover"]}; }}
+QPushButton:disabled {{
+    background: {colors["disabled"]};
+    color: {colors["disabled_text"]};
+    border: 1px solid {colors["disabled_border"]};
+}}
+QPushButton#primary {{
+    background: {colors["accent"]};
     color: #ffffff;
-    border: 1px solid #0a64d8;
+    border: 1px solid {colors["accent"]};
     font-weight: 600;
     padding: 8px 18px;
-}
-QPushButton#primary:hover { background: #0854b8; color: #ffffff; }
-QPushButton#primary:disabled, QPushButton#primary:disabled:hover {
-    background: #d8d8de;
-    color: #3a3a3c;
-    border: 1px solid #d8d8de;
-}
-QPushButton#stop {
-    background: #b42318;
+}}
+QPushButton#primary:hover {{ background: {colors["accent_hover"]}; color: #ffffff; }}
+QPushButton#primary:disabled, QPushButton#primary:disabled:hover {{
+    background: {colors["disabled"]};
+    color: {colors["disabled_text"]};
+    border: 1px solid {colors["disabled_border"]};
+}}
+QPushButton#stop {{
+    background: {colors["stop"]};
     color: #ffffff;
-    border: 1px solid #b42318;
-}
-QPushButton#stop:hover { background: #912018; color: #ffffff; }
-QPushButton#stop:disabled, QPushButton#stop:disabled:hover {
-    background: #f2f2f7;
-    color: #3a3a3c;
-    border: 1px solid #aeaeb2;
-}
-QTabWidget::pane { border: none; background: transparent; }
-QTabBar::tab {
+    border: 1px solid {colors["stop"]};
+}}
+QPushButton#stop:hover {{ background: {colors["stop_hover"]}; color: #ffffff; }}
+QPushButton#stop:disabled, QPushButton#stop:disabled:hover {{
+    background: {colors["disabled"]};
+    color: {colors["disabled_text"]};
+    border: 1px solid {colors["disabled_border"]};
+}}
+QTabWidget::pane {{ border: none; background: transparent; }}
+QTabBar::tab {{
     background: transparent;
-    color: #1c1c1e;
+    color: {colors["text"]};
     padding: 8px 16px;
     border: none;
     border-bottom: 2px solid transparent;
     font-weight: 600;
-}
-QTabBar::tab:selected { color: #0a64d8; border-bottom: 2px solid #0a64d8; }
-QListWidget#gallery::item { color: #1c1c1e; padding: 4px; }
-QScrollArea { border: none; background: transparent; }
+}}
+QTabBar::tab:selected {{ color: {colors["accent"]}; border-bottom: 2px solid {colors["accent"]}; }}
+QListWidget#gallery::item {{ color: {colors["text"]}; padding: 4px; }}
+QListWidget#gallery::item:selected {{ background: {colors["accent"]}; color: #ffffff; }}
+QScrollArea {{ border: none; background: transparent; }}
+QSplitter::handle {{ background: {colors["split"]}; }}
+QSplitter::handle:horizontal {{ width: 8px; }}
+QScrollBar:vertical, QScrollBar:horizontal {{ background: {colors["page"]}; }}
+QScrollBar::handle:vertical, QScrollBar::handle:horizontal {{
+    background: {colors["scroll"]};
+    border-radius: 4px;
+    min-height: 24px;
+    min-width: 24px;
+}}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0px; width: 0px; }}
 """
+
+
+LIGHT_COLORS = {
+    "text": "#1c1c1e",
+    "page": "#f2f2f7",
+    "panel": "#ffffff",
+    "panel_border": "#d1d1d6",
+    "warning": "#9f1239",
+    "card_border": "#8e8e93",
+    "drop": "#f2f2f7",
+    "drop_border": "#636366",
+    "accent": "#0a64d8",
+    "accent_hover": "#0854b8",
+    "field": "#ffffff",
+    "field_border": "#636366",
+    "button": "#ffffff",
+    "button_border": "#1c1c1e",
+    "button_hover": "#f2f2f7",
+    "disabled": "#f2f2f7",
+    "disabled_text": "#3a3a3c",
+    "disabled_border": "#aeaeb2",
+    "stop": "#b42318",
+    "stop_hover": "#912018",
+    "split": "#d1d1d6",
+    "scroll": "#aeaeb2",
+}
+
+DARK_COLORS = {
+    "text": "#f5f5f7",
+    "page": "#1c1c1e",
+    "panel": "#2c2c2e",
+    "panel_border": "#636366",
+    "warning": "#ff8fa3",
+    "card_border": "#aeaeb2",
+    "drop": "#1c1c1e",
+    "drop_border": "#aeaeb2",
+    "accent": "#0a64d8",
+    "accent_hover": "#0854b8",
+    "field": "#2c2c2e",
+    "field_border": "#aeaeb2",
+    "button": "#2c2c2e",
+    "button_border": "#f5f5f7",
+    "button_hover": "#3a3a3c",
+    "disabled": "#3a3a3c",
+    "disabled_text": "#d1d1d6",
+    "disabled_border": "#636366",
+    "stop": "#b42318",
+    "stop_hover": "#912018",
+    "split": "#636366",
+    "scroll": "#636366",
+}
+
+LIGHT_STYLESHEET = _stylesheet(LIGHT_COLORS)
+DARK_STYLESHEET = _stylesheet(DARK_COLORS)
+STYLESHEET = LIGHT_STYLESHEET
+_current_theme = "light"
 
 STATUS_TITLES = {
     "generating": "Generating",
@@ -170,18 +239,73 @@ STATUS_TITLES = {
     "cancelled": "Cancelled",
 }
 
-STATUS_COLORS = {
+STATUS_COLORS_LIGHT = {
     "approved": "#1f7a4d",
     "passed": "#1f6f78",
     "failed": "#8c3a32",
     "rejected": "#8c3a32",
     "error": "#8c3a32",
     "cap": "#8a5a12",
-    "unreviewed": "#1d1b18",
-        "generating": "#3a3a3c",
+    "unreviewed": "#1c1c1e",
+    "generating": "#3a3a3c",
     "reviewing": "#0a64d8",
     "cancelled": "#3a3a3c",
 }
+
+STATUS_COLORS_DARK = {
+    "approved": "#3dd68c",
+    "passed": "#5ee0e6",
+    "failed": "#ff8a80",
+    "rejected": "#ff8a80",
+    "error": "#ff8a80",
+    "cap": "#ffc14d",
+    "unreviewed": "#f5f5f7",
+    "generating": "#d1d1d6",
+    "reviewing": "#64b5ff",
+    "cancelled": "#d1d1d6",
+}
+
+
+def status_color(status: str) -> str:
+    table = STATUS_COLORS_DARK if _current_theme == "dark" else STATUS_COLORS_LIGHT
+    return table.get(status, table["unreviewed"])
+
+
+def _palette(colors: dict[str, str]) -> QPalette:
+    palette = QPalette()
+    text = QColor(colors["text"])
+    page = QColor(colors["page"])
+    field = QColor(colors["field"])
+    button = QColor(colors["button"])
+    accent = QColor(colors["accent"])
+    disabled = QColor(colors["disabled_text"])
+    palette.setColor(QPalette.ColorRole.Window, page)
+    palette.setColor(QPalette.ColorRole.WindowText, text)
+    palette.setColor(QPalette.ColorRole.Base, field)
+    palette.setColor(QPalette.ColorRole.AlternateBase, page)
+    palette.setColor(QPalette.ColorRole.Text, text)
+    palette.setColor(QPalette.ColorRole.Button, button)
+    palette.setColor(QPalette.ColorRole.ButtonText, text)
+    palette.setColor(QPalette.ColorRole.Highlight, accent)
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.PlaceholderText, QColor(colors["drop_border"]))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, field)
+    palette.setColor(QPalette.ColorRole.ToolTipText, text)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, disabled)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, disabled)
+    palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, disabled)
+    return palette
+
+
+def apply_theme(theme: str) -> None:
+    global _current_theme
+    _current_theme = "dark" if theme == "dark" else "light"
+    app = QApplication.instance()
+    if app is None:
+        return
+    colors = DARK_COLORS if _current_theme == "dark" else LIGHT_COLORS
+    app.setPalette(_palette(colors))
+    app.setStyleSheet(DARK_STYLESHEET if _current_theme == "dark" else LIGHT_STYLESHEET)
 
 
 def pil_to_pixmap(image: Image.Image) -> QPixmap:
@@ -224,7 +348,13 @@ def section(text: str) -> QLabel:
     return label
 
 
+def narrow_combo(combo: QComboBox) -> None:
+    combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+    combo.setMinimumContentsLength(14)
+
+
 def fill_combo(combo: QComboBox, pairs: list[tuple[str, str]], current: str) -> None:
+    narrow_combo(combo)
     combo.blockSignals(True)
     combo.clear()
     for value, label in pairs:
@@ -308,10 +438,10 @@ class ImageDrop(QFrame):
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(self.row_host)
-        scroll.setMinimumHeight(132)
+        scroll.setMinimumHeight(104)
         self.scroll = scroll
         outer.addWidget(scroll)
-        self.setMinimumHeight(150)
+        self.setMinimumHeight(118)
         self._rebuild()
 
     def dragEnterEvent(self, event) -> None:
@@ -428,6 +558,7 @@ class ProductCard(QFrame):
         self.mode = QComboBox()
         for value, label in MODES:
             self.mode.addItem(label, value)
+        narrow_combo(self.mode)
         self.mode.currentIndexChanged.connect(self._mode_changed)
         mode_row.addWidget(self.mode, 1)
         self.scale = QDoubleSpinBox()
@@ -445,9 +576,11 @@ class ProductCard(QFrame):
         buttons = QHBoxLayout()
         self.plain_button = QPushButton("Cut out plain background")
         self.plain_button.setObjectName("secondary")
+        self.plain_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.plain_button.clicked.connect(lambda: self.cutout_requested.emit(self, "plain"))
         self.rembg_button = QPushButton("Cut out complex background")
         self.rembg_button.setObjectName("secondary")
+        self.rembg_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.rembg_button.clicked.connect(lambda: self.cutout_requested.emit(self, "rembg"))
         buttons.addWidget(self.plain_button)
         buttons.addWidget(self.rembg_button)
@@ -460,7 +593,9 @@ class ProductCard(QFrame):
         tolerance_row.addWidget(self.tolerance)
         tolerance_row.addStretch(1)
         layout.addLayout(tolerance_row)
-        extra = QHBoxLayout()
+        extra = QGridLayout()
+        extra.setHorizontalSpacing(8)
+        extra.setVerticalSpacing(8)
         mask_button = QPushButton("Choose mask")
         mask_button.setObjectName("secondary")
         mask_button.clicked.connect(self._choose_mask)
@@ -473,10 +608,12 @@ class ProductCard(QFrame):
         clear_images = QPushButton("Clear images")
         clear_images.setObjectName("secondary")
         clear_images.clicked.connect(self.images.clear_paths)
-        extra.addWidget(mask_button)
-        extra.addWidget(clear_mask)
-        extra.addWidget(clear_cutout)
-        extra.addWidget(clear_images)
+        for button in (mask_button, clear_mask, clear_cutout, clear_images):
+            button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        extra.addWidget(mask_button, 0, 0)
+        extra.addWidget(clear_mask, 0, 1)
+        extra.addWidget(clear_cutout, 1, 0)
+        extra.addWidget(clear_images, 1, 1)
         layout.addLayout(extra)
         self.preview = QLabel("No cutout yet.")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignLeft)
@@ -657,6 +794,10 @@ class MainWindow(QMainWindow):
         title = QLabel("Batch Image Studio")
         title.setObjectName("title")
         row.addWidget(title)
+        self.theme_box = QCheckBox("Dark theme")
+        self.theme_box.setToolTip("Switch the window between the light and dark color schemes. The choice is saved on this Mac.")
+        self.theme_box.toggled.connect(self._theme_toggled)
+        row.addWidget(self.theme_box)
         row.addStretch(1)
         self.run_spend = QLabel("This run $0.0000 spent")
         self.run_spend.setObjectName("status")
@@ -682,7 +823,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._work_panel())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([420, 760])
+        splitter.setSizes([440, 840])
         layout.addWidget(splitter, 1)
         bar = QHBoxLayout()
         self.generate_button = QPushButton("Generate")
@@ -720,9 +861,11 @@ class MainWindow(QMainWindow):
         key_buttons = QHBoxLayout()
         save_key = QPushButton("Save key")
         save_key.setObjectName("primary")
+        save_key.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         save_key.clicked.connect(self.on_save_key)
         remove_key = QPushButton("Remove key")
         remove_key.setObjectName("secondary")
+        remove_key.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         remove_key.clicked.connect(self.on_remove_key)
         key_buttons.addWidget(save_key)
         key_buttons.addWidget(remove_key)
@@ -735,12 +878,14 @@ class MainWindow(QMainWindow):
         self.background = QComboBox()
         for value, label in BACKGROUNDS:
             self.background.addItem(label, value)
+        narrow_combo(self.background)
         self.model.currentIndexChanged.connect(self._model_changed)
         fill_combo(self.model, IMAGE_MODELS, IMAGE_MODELS[0][0])
         fields = QFormLayout()
         fields.setHorizontalSpacing(12)
         fields.setVerticalSpacing(10)
         fields.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        fields.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)
         fields.addRow("Model", self.model)
         fields.addRow("Quality", self.quality)
         fields.addRow("Size", self.size)
@@ -767,7 +912,7 @@ class MainWindow(QMainWindow):
         self.screen_box = QCheckBox("Review each image before a retry")
         self.screen_box.setChecked(True)
         form.addWidget(self.screen_box)
-        self.send_criteria = QCheckBox("Send these criteria to the image model as requirements")
+        self.send_criteria = QCheckBox("Send the criteria to the image model")
         self.send_criteria.setChecked(True)
         form.addWidget(self.send_criteria)
         self.screen_model = QComboBox()
@@ -777,7 +922,7 @@ class MainWindow(QMainWindow):
         form.addWidget(muted("The image model does not see this text unless the checkbox above is on. Put the scene description in the prompt."))
         self.criteria = QPlainTextEdit()
         self.criteria.setPlainText(DEFAULT_CRITERIA.strip())
-        self.criteria.setFixedHeight(160)
+        self.criteria.setFixedHeight(120)
         form.addWidget(self.criteria)
         form.addWidget(section("Output"))
         self.folder_button = QPushButton("Choose output folder")
@@ -805,6 +950,7 @@ class MainWindow(QMainWindow):
         self.cap_spin.valueChanged.connect(self._cap_changed)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(content)
         self._model_changed()
@@ -819,7 +965,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(section("Prompt"))
         self.prompt = QPlainTextEdit()
         self.prompt.setPlaceholderText("Describe the scene, the product, the lighting, and the framing.")
-        self.prompt.setMinimumHeight(140)
+        self.prompt.setMinimumHeight(100)
         self.prompt.textChanged.connect(self.schedule_save)
         layout.addWidget(self.prompt)
         clear_prompt = QPushButton("Clear prompt")
@@ -862,6 +1008,7 @@ class MainWindow(QMainWindow):
         layout.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidget(content)
         return scroll
@@ -872,6 +1019,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 8, 0, 0)
         left = QVBoxLayout()
         self.filter = QComboBox()
+        narrow_combo(self.filter)
         self.filter.addItem("All", "all")
         self.filter.addItem("In progress", "progress")
         self.filter.addItem("Needs a decision", "decision")
@@ -969,6 +1117,15 @@ class MainWindow(QMainWindow):
         fill_combo(self.size, [(item, item) for item in sizes_for(model)], str(self.size.currentData() or "1024x1024"))
         self.schedule_save()
 
+    def _theme_toggled(self, checked: bool) -> None:
+        self._apply_theme("dark" if checked else "light")
+        self.schedule_save()
+
+    def _apply_theme(self, theme: str) -> None:
+        apply_theme(theme)
+        for record in self.candidates.values():
+            self._render_item(record)
+
     def schedule_save(self, *_args) -> None:
         if self._loading:
             return
@@ -997,6 +1154,13 @@ class MainWindow(QMainWindow):
             if isinstance(data, dict):
                 self.add_product(data=data, notify=False)
         self.product_serial = len(self.cards) + 1
+        theme = str(settings.get("theme") or "light")
+        if theme not in {"light", "dark"}:
+            theme = "light"
+        self.theme_box.blockSignals(True)
+        self.theme_box.setChecked(theme == "dark")
+        self.theme_box.blockSignals(False)
+        self._apply_theme(theme)
         geometry = str(settings.get("geometry") or "")
         if geometry:
             self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
@@ -1024,6 +1188,7 @@ class MainWindow(QMainWindow):
                 "screen_model": self.screen_model.currentData(),
                 "output_dir": self.output_dir,
                 "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+                "theme": "dark" if self.theme_box.isChecked() else "light",
             }
         )
         try:
@@ -1390,14 +1555,14 @@ class MainWindow(QMainWindow):
         self.candidates[cid] = record
         if cid not in self.order:
             self.order.append(cid)
-        self._paint_item(record)
+        self._render_item(record)
         self.save_manifest()
         self.refresh_totals()
         self._review_title()
         if self._selected_id() == cid:
             self.show_record(record)
 
-    def _paint_item(self, record: dict) -> None:
+    def _render_item(self, record: dict) -> None:
         cid = str(record["id"])
         item = self.items.get(cid)
         if item is None:
@@ -1417,7 +1582,7 @@ class MainWindow(QMainWindow):
             title = "New from brief"
         status = str(record.get("status") or "generating")
         item.setText(f"{record.get('product_name') or 'Image'}\n{title}\n{STATUS_TITLES.get(status, status)}")
-        item.setForeground(QColor(STATUS_COLORS.get(status, "#1d1b18")))
+        item.setForeground(QColor(status_color(status)))
         icon = thumbnail_pixmap(str(record.get("path") or ""), 180)
         if not icon.isNull():
             item.setIcon(QIcon(icon))
@@ -1464,7 +1629,7 @@ class MainWindow(QMainWindow):
                 cid = str(normalized["id"])
                 self.order.append(cid)
                 self.candidates[cid] = normalized
-                self._paint_item(normalized)
+                self._render_item(normalized)
         self.refresh_totals()
         self._review_title()
         self.show_record(None)

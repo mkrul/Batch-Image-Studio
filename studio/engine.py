@@ -138,7 +138,7 @@ def build_prompt(
         parts.append("Do not continue, vary, or evolve an earlier generation.")
     if mode == "lock":
         parts.append(
-            "Repaint the scene around the product. Do not redraw, relabel, recolor, or move the product. "
+            "Rerender the scene around the product. Do not redraw, relabel, recolor, or move the product. "
             "The original product pixels will be put back after this request."
         )
         if editing:
@@ -790,7 +790,7 @@ class Engine(QObject):
             if fraction < 0.001:
                 raise RuntimeError(f"{product.name}: the kept area is almost empty.")
             if fraction > 0.98:
-                raise RuntimeError(f"{product.name}: the kept area is almost the whole frame, so there is no scene to repaint.")
+                raise RuntimeError(f"{product.name}: the kept area is almost the whole frame, so there is no scene to rerender.")
             size = f"{width}x{height}"
             restore_name = "restore.png"
             protect_name = "protect.png"

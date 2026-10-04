@@ -66,7 +66,7 @@ Generate another from the original brief asks for a new image from the saved bri
 
 Reference only lets the model create the whole image. It can redraw the package, the label, and the shape.
 
-Lock product pixels is for a product that should stay in its original frame. Create a cutout, or choose a mask, first. The model is asked to repaint the surrounding scene. Afterward the program pastes the original product pixels back. A mask from the API is only guidance. The paste is the guarantee.
+Lock product pixels is for a product that should stay in its original frame. Create a cutout, or choose a mask, first. The model is asked to rerender the surrounding scene. Afterward the program pastes the original product pixels back. A mask from the API is only guidance. The paste is the guarantee.
 
 The photograph may be resized to a size the API accepts. The pixels that are pasted are that resized photograph, not a new drawing of the product. Lock mode does not use the size menu. It keeps the photograph's frame. It cannot move or recolor the product. Use Reference only if the product itself must change.
 
