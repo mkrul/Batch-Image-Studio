@@ -1,0 +1,1648 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from PIL import Image
+from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QImageReader, QKeySequence, QPixmap, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QSpinBox,
+    QSplitter,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .config import (
+    BACKGROUNDS,
+    CUTOUT_DIR,
+    DEFAULT_CRITERIA,
+    IMAGE_MODELS,
+    MODE_HELP,
+    MODES,
+    SCREEN_MODELS,
+    atomic_write,
+    clear_api_key,
+    default_output,
+    load_api_key,
+    load_settings,
+    qualities_for,
+    save_api_key,
+    save_settings,
+    sizes_for,
+)
+from .engine import Engine, ProductSpec, RunContext
+from .imaging import checker_preview, is_cutout, list_images, load_rgba, locked_output_size, safe_slug
+from .pricing import estimate_image_call, estimate_screen_call, money
+
+STYLESHEET = """
+QWidget { color: #1c1c1e; font-size: 13px; background: transparent; }
+QMainWindow, QWidget#root, QWidget#settings { background: #f2f2f7; }
+QWidget#work, QListWidget#gallery, QPlainTextEdit#log {
+    background: #ffffff;
+    border: 1px solid #d1d1d6;
+    border-radius: 12px;
+}
+QLabel#title { color: #1c1c1e; font-size: 20px; font-weight: 600; }
+QLabel#section { color: #1c1c1e; font-size: 15px; font-weight: 600; padding-top: 10px; }
+QLabel#activity, QLabel#status { color: #1c1c1e; font-weight: 600; }
+QLabel#muted { color: #1c1c1e; }
+QLabel#warning { color: #9f1239; font-weight: 600; }
+QFrame#card {
+    background: #ffffff;
+    border: 1px solid #8e8e93;
+    border-radius: 10px;
+}
+QFrame#drop {
+    background: #f2f2f7;
+    border: 1px dashed #636366;
+    border-radius: 10px;
+}
+QFrame#drop QLabel { color: #1c1c1e; }
+QFrame#drop[active="true"] {
+    border: 2px solid #0a64d8;
+    background: #ffffff;
+}
+QLineEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+    background: #ffffff;
+    color: #1c1c1e;
+    border: 1px solid #636366;
+    border-radius: 6px;
+    padding: 6px 8px;
+    min-height: 22px;
+    selection-background-color: #0a64d8;
+    selection-color: #ffffff;
+}
+QPlainTextEdit#log { padding: 8px; }
+QComboBox QAbstractItemView {
+    background: #ffffff;
+    color: #1c1c1e;
+    selection-background-color: #0a64d8;
+    selection-color: #ffffff;
+}
+QCheckBox { color: #1c1c1e; spacing: 8px; }
+QPushButton {
+    background: #ffffff;
+    color: #1c1c1e;
+    border: 1px solid #1c1c1e;
+    border-radius: 6px;
+    padding: 7px 12px;
+    min-height: 22px;
+}
+QPushButton:hover { background: #f2f2f7; }
+QPushButton:disabled {
+    background: #f2f2f7;
+    color: #3a3a3c;
+    border: 1px solid #aeaeb2;
+}
+QPushButton#primary {
+    background: #0a64d8;
+    color: #ffffff;
+    border: 1px solid #0a64d8;
+    font-weight: 600;
+    padding: 8px 18px;
+}
+QPushButton#primary:hover { background: #0854b8; color: #ffffff; }
+QPushButton#primary:disabled, QPushButton#primary:disabled:hover {
+    background: #d8d8de;
+    color: #3a3a3c;
+    border: 1px solid #d8d8de;
+}
+QPushButton#stop {
+    background: #b42318;
+    color: #ffffff;
+    border: 1px solid #b42318;
+}
+QPushButton#stop:hover { background: #912018; color: #ffffff; }
+QPushButton#stop:disabled, QPushButton#stop:disabled:hover {
+    background: #f2f2f7;
+    color: #3a3a3c;
+    border: 1px solid #aeaeb2;
+}
+QTabWidget::pane { border: none; background: transparent; }
+QTabBar::tab {
+    background: transparent;
+    color: #1c1c1e;
+    padding: 8px 16px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    font-weight: 600;
+}
+QTabBar::tab:selected { color: #0a64d8; border-bottom: 2px solid #0a64d8; }
+QListWidget#gallery::item { color: #1c1c1e; padding: 4px; }
+QScrollArea { border: none; background: transparent; }
+"""
+
+STATUS_TITLES = {
+    "generating": "Generating",
+    "reviewing": "Reviewing",
+    "passed": "Screener passed",
+    "failed": "Screener rejected",
+    "unreviewed": "Needs your review",
+    "approved": "Approved",
+    "rejected": "Rejected",
+    "error": "Error",
+    "cap": "Spend cap reached",
+    "cancelled": "Cancelled",
+}
+
+STATUS_COLORS = {
+    "approved": "#1f7a4d",
+    "passed": "#1f6f78",
+    "failed": "#8c3a32",
+    "rejected": "#8c3a32",
+    "error": "#8c3a32",
+    "cap": "#8a5a12",
+    "unreviewed": "#1d1b18",
+        "generating": "#3a3a3c",
+    "reviewing": "#0a64d8",
+    "cancelled": "#3a3a3c",
+}
+
+
+def pil_to_pixmap(image: Image.Image) -> QPixmap:
+    rgba = image.convert("RGBA")
+    data = rgba.tobytes("raw", "RGBA")
+    qimage = QImage(data, rgba.width, rgba.height, rgba.width * 4, QImage.Format.Format_RGBA8888)
+    return QPixmap.fromImage(qimage.copy())
+
+
+def thumbnail_pixmap(path: str, edge: int) -> QPixmap:
+    if not path or not Path(path).is_file():
+        return QPixmap()
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid() and max(size.width(), size.height()) > edge:
+        scale = edge / max(size.width(), size.height())
+        reader.setScaledSize(QSize(max(1, int(size.width() * scale)), max(1, int(size.height() * scale))))
+    image = reader.read()
+    if not image.isNull():
+        return QPixmap.fromImage(image)
+    try:
+        pil = load_rgba(Path(path))
+        pil.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+        return pil_to_pixmap(pil)
+    except Exception:
+        return QPixmap()
+
+
+def muted(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setObjectName("muted")
+    label.setWordWrap(True)
+    return label
+
+
+def section(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setObjectName("section")
+    return label
+
+
+def fill_combo(combo: QComboBox, pairs: list[tuple[str, str]], current: str) -> None:
+    combo.blockSignals(True)
+    combo.clear()
+    for value, label in pairs:
+        combo.addItem(label, value)
+    index = combo.findData(current)
+    if index < 0:
+        index = combo.findData("high")
+    if index < 0:
+        index = combo.findData("1024x1024")
+    combo.setCurrentIndex(index if index >= 0 else 0)
+    combo.blockSignals(False)
+
+
+class FuncThread(QThread):
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn) -> None:
+        super().__init__()
+        self._fn = fn
+
+    def run(self) -> None:
+        try:
+            self.succeeded.emit(self._fn())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class Thumb(QFrame):
+    remove = Signal(str)
+    make_first = Signal(str)
+
+    def __init__(self, path: str, index: int) -> None:
+        super().__init__()
+        self.path = path
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(2)
+        image = QLabel()
+        image.setPixmap(thumbnail_pixmap(path, 88))
+        image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(image)
+        name = QLabel()
+        name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        metrics = QFontMetrics(name.font())
+        name.setText(metrics.elidedText(Path(path).name, Qt.TextElideMode.ElideMiddle, 96))
+        layout.addWidget(name)
+        row = QHBoxLayout()
+        remove = QPushButton("Remove")
+        remove.setObjectName("secondary")
+        remove.clicked.connect(lambda: self.remove.emit(self.path))
+        row.addWidget(remove)
+        if index > 0:
+            first = QPushButton("First")
+            first.setObjectName("secondary")
+            first.clicked.connect(lambda: self.make_first.emit(self.path))
+            row.addWidget(first)
+        layout.addLayout(row)
+
+
+class ImageDrop(QFrame):
+    changed = Signal()
+
+    def __init__(self, empty_text: str) -> None:
+        super().__init__()
+        self.setObjectName("drop")
+        self.setAcceptDrops(True)
+        self.paths: list[str] = []
+        self.empty_text = empty_text
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        self.empty = QLabel(empty_text)
+        self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty.setWordWrap(True)
+        self.empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        outer.addWidget(self.empty)
+        self.row_host = QWidget()
+        self.row = QHBoxLayout(self.row_host)
+        self.row.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(self.row_host)
+        scroll.setMinimumHeight(132)
+        self.scroll = scroll
+        outer.addWidget(scroll)
+        self.setMinimumHeight(150)
+        self._rebuild()
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self._active(True)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._active(False)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        self._active(False)
+        self.add_paths(self._urls(event))
+        event.acceptProposedAction()
+
+    def _active(self, active: bool) -> None:
+        self.setProperty("active", active)
+        self.style().unpolish(self)
+        self.style().polish(self)
+
+    def _urls(self, event) -> list[str]:
+        found = []
+        for url in event.mimeData().urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_dir():
+                found.extend(str(item) for item in list_images(path))
+            elif path.is_file() and path.suffix.lower() in {
+                ".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff", ".heic", ".heif", ".bmp"
+            }:
+                found.append(str(path))
+        return found
+
+    def add_paths(self, paths: list[str]) -> None:
+        changed = False
+        for path in paths:
+            if path not in self.paths:
+                self.paths.append(path)
+                changed = True
+        if changed:
+            self._rebuild()
+            self.changed.emit()
+
+    def set_paths(self, paths: list[str]) -> None:
+        self.paths = [path for path in paths if Path(path).is_file()]
+        self._rebuild()
+
+    def clear_paths(self) -> None:
+        self.paths = []
+        self._rebuild()
+        self.changed.emit()
+
+    def _remove(self, path: str) -> None:
+        self.paths = [item for item in self.paths if item != path]
+        self._rebuild()
+        self.changed.emit()
+
+    def _make_first(self, path: str) -> None:
+        if path not in self.paths:
+            return
+        self.paths = [path, *[item for item in self.paths if item != path]]
+        self._rebuild()
+        self.changed.emit()
+
+    def _rebuild(self) -> None:
+        while self.row.count():
+            item = self.row.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self.empty.setVisible(not self.paths)
+        self.scroll.setVisible(bool(self.paths))
+        for index, path in enumerate(self.paths):
+            thumb = Thumb(path, index)
+            thumb.remove.connect(self._remove)
+            thumb.make_first.connect(self._make_first)
+            self.row.addWidget(thumb)
+        self.row.addStretch(1)
+
+
+class ProductCard(QFrame):
+    changed = Signal()
+    remove_requested = Signal(object)
+    cutout_requested = Signal(object, str)
+
+    def __init__(self, spec_id: str | None = None) -> None:
+        super().__init__()
+        self.spec_id = spec_id or uuid.uuid4().hex[:8]
+        self.mask_path: str | None = None
+        self.cutout_path: str | None = None
+        self.setObjectName("card")
+        self.setAcceptDrops(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(8)
+        header = QHBoxLayout()
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("Product name")
+        header.addWidget(self.name, 1)
+        remove = QPushButton("Remove product")
+        remove.setObjectName("secondary")
+        remove.clicked.connect(lambda: self.remove_requested.emit(self))
+        header.addWidget(remove)
+        layout.addLayout(header)
+        self.notes = QPlainTextEdit()
+        self.notes.setPlaceholderText("Optional instructions for this product only")
+        self.notes.setFixedHeight(52)
+        layout.addWidget(self.notes)
+        mode_row = QHBoxLayout()
+        self.mode = QComboBox()
+        for value, label in MODES:
+            self.mode.addItem(label, value)
+        self.mode.currentIndexChanged.connect(self._mode_changed)
+        mode_row.addWidget(self.mode, 1)
+        self.scale = QDoubleSpinBox()
+        self.scale.setRange(0.2, 0.9)
+        self.scale.setSingleStep(0.05)
+        self.scale.setValue(0.62)
+        self.scale.setPrefix("Height ")
+        mode_row.addWidget(self.scale)
+        layout.addLayout(mode_row)
+        self.mode_help = muted(MODE_HELP["reference"])
+        layout.addWidget(self.mode_help)
+        self.images = ImageDrop("Drop product photographs here. The first image is the frame that stays in place when pixels are locked.")
+        self.images.changed.connect(self.changed.emit)
+        layout.addWidget(self.images)
+        buttons = QHBoxLayout()
+        self.plain_button = QPushButton("Cut out plain background")
+        self.plain_button.setObjectName("secondary")
+        self.plain_button.clicked.connect(lambda: self.cutout_requested.emit(self, "plain"))
+        self.rembg_button = QPushButton("Cut out complex background")
+        self.rembg_button.setObjectName("secondary")
+        self.rembg_button.clicked.connect(lambda: self.cutout_requested.emit(self, "rembg"))
+        buttons.addWidget(self.plain_button)
+        buttons.addWidget(self.rembg_button)
+        layout.addLayout(buttons)
+        tolerance_row = QHBoxLayout()
+        tolerance_row.addWidget(QLabel("Background tolerance"))
+        self.tolerance = QSpinBox()
+        self.tolerance.setRange(8, 80)
+        self.tolerance.setValue(34)
+        tolerance_row.addWidget(self.tolerance)
+        tolerance_row.addStretch(1)
+        layout.addLayout(tolerance_row)
+        extra = QHBoxLayout()
+        mask_button = QPushButton("Choose mask")
+        mask_button.setObjectName("secondary")
+        mask_button.clicked.connect(self._choose_mask)
+        clear_mask = QPushButton("Clear mask")
+        clear_mask.setObjectName("secondary")
+        clear_mask.clicked.connect(self._clear_mask)
+        clear_cutout = QPushButton("Clear cutout")
+        clear_cutout.setObjectName("secondary")
+        clear_cutout.clicked.connect(self._clear_cutout)
+        clear_images = QPushButton("Clear images")
+        clear_images.setObjectName("secondary")
+        clear_images.clicked.connect(self.images.clear_paths)
+        extra.addWidget(mask_button)
+        extra.addWidget(clear_mask)
+        extra.addWidget(clear_cutout)
+        extra.addWidget(clear_images)
+        layout.addLayout(extra)
+        self.preview = QLabel("No cutout yet.")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(self.preview)
+        self.state = muted("No cutout or mask yet.")
+        layout.addWidget(self.state)
+        self.plain_button.setToolTip("For a product on a plain backdrop. Only the backdrop becomes transparent. The product pixels stay as they are. Check the preview.")
+        self.rembg_button.setToolTip("Uses a local model and does not send the photograph to OpenAI. Install it with .venv/bin/python -m pip install rembg")
+        mask_button.setToolTip("PNG mask. Transparent areas are regenerated and opaque areas are kept. If the file has no transparency, white is kept and black is regenerated.")
+        self.name.textChanged.connect(lambda _text: self.changed.emit())
+        self.notes.textChanged.connect(self.changed.emit)
+        self.scale.valueChanged.connect(lambda _value: self.changed.emit())
+        self.tolerance.valueChanged.connect(lambda _value: self.changed.emit())
+        self._mode_changed()
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        self.images.dropEvent(event)
+
+    def _mode_changed(self, _index: int = 0) -> None:
+        mode = self.mode.currentData()
+        self.mode_help.setText(MODE_HELP.get(mode, ""))
+        self.scale.setVisible(mode == "composite")
+        self.changed.emit()
+
+    def _choose_mask(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Mask", "", "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff)")
+        if path:
+            self.mask_path = path
+            self._refresh_state()
+            self.changed.emit()
+
+    def _clear_mask(self) -> None:
+        self.mask_path = None
+        self._refresh_state()
+        self.changed.emit()
+
+    def _clear_cutout(self) -> None:
+        self.cutout_path = None
+        self.preview.setPixmap(QPixmap())
+        self.preview.setText("No cutout yet.")
+        self._refresh_state()
+        self.changed.emit()
+
+    def set_cutout_busy(self, busy: bool) -> None:
+        self.plain_button.setEnabled(not busy)
+        self.rembg_button.setEnabled(not busy)
+
+    def set_cutout(self, path: str) -> None:
+        self.cutout_path = path
+        try:
+            preview = checker_preview(load_rgba(Path(path)))
+            self.preview.setText("")
+            self.preview.setPixmap(pil_to_pixmap(preview))
+        except Exception:
+            self.preview.setText("Cutout saved, but the preview could not be shown.")
+        self._refresh_state()
+        self.changed.emit()
+
+    def _refresh_state(self) -> None:
+        parts = []
+        if self.cutout_path and Path(self.cutout_path).is_file():
+            parts.append("Cutout ready")
+        if self.mask_path and Path(self.mask_path).is_file():
+            parts.append(f"Mask: {Path(self.mask_path).name}")
+        self.state.setText(". ".join(parts) if parts else "No cutout or mask yet.")
+
+    def spec(self) -> ProductSpec:
+        return ProductSpec(
+            id=self.spec_id,
+            name=self.name.text().strip() or "Product",
+            notes=self.notes.toPlainText().strip(),
+            mode=str(self.mode.currentData() or "reference"),
+            scale=float(self.scale.value()),
+            image_paths=tuple(self.images.paths),
+            mask_path=self.mask_path if self.mask_path and Path(self.mask_path).is_file() else None,
+            cutout_path=self.cutout_path if self.cutout_path and Path(self.cutout_path).is_file() else None,
+        )
+
+    def to_dict(self) -> dict:
+        spec = self.spec()
+        return {
+            "id": spec.id,
+            "name": spec.name,
+            "notes": spec.notes,
+            "mode": spec.mode,
+            "scale": spec.scale,
+            "tolerance": int(self.tolerance.value()),
+            "images": list(spec.image_paths),
+            "mask": spec.mask_path or "",
+            "cutout": spec.cutout_path or "",
+        }
+
+    def load_dict(self, data: dict) -> None:
+        self.spec_id = str(data.get("id") or self.spec_id)
+        self.name.setText(str(data.get("name") or ""))
+        self.notes.setPlainText(str(data.get("notes") or ""))
+        index = self.mode.findData(data.get("mode") or "reference")
+        self.mode.setCurrentIndex(index if index >= 0 else 0)
+        self.scale.setValue(float(data.get("scale") or 0.62))
+        self.tolerance.setValue(int(data.get("tolerance") or 34))
+        self.images.set_paths([str(path) for path in data.get("images") or []])
+        mask = str(data.get("mask") or "")
+        cutout = str(data.get("cutout") or "")
+        self.mask_path = mask if mask and Path(mask).is_file() else None
+        self.cutout_path = cutout if cutout and Path(cutout).is_file() else None
+        if self.cutout_path:
+            self.set_cutout(self.cutout_path)
+        else:
+            self._refresh_state()
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Batch Image Studio")
+        self.resize(1280, 860)
+        self.setMinimumSize(1020, 700)
+        self.output_dir = default_output()
+        self._loading = False
+        self._threads: list[FuncThread] = []
+        self.cards: list[ProductCard] = []
+        self.product_serial = 1
+        self.candidates: dict[str, dict] = {}
+        self.order: list[str] = []
+        self.items: dict[str, QListWidgetItem] = {}
+        self.preview_pix = QPixmap()
+        self.engine = Engine()
+        self.engine.key_getter = load_api_key
+        self.engine.log.connect(self.append_log)
+        self.engine.candidate.connect(self.on_candidate)
+        self.engine.spend.connect(self.on_spend)
+        self.engine.busy.connect(self.on_busy)
+        self.engine.idle.connect(self.on_idle)
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self.save_session)
+        self._build()
+        self._loading = True
+        self._apply_settings(load_settings())
+        self._loading = False
+        self.engine.set_cap(float(self.cap_spin.value()))
+        self.load_manifest()
+        self._key_status()
+        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
+        shortcut.activated.connect(self.on_generate)
+        self.generate_shortcut = shortcut
+
+    def _build(self) -> None:
+        root = QWidget()
+        root.setObjectName("root")
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(16, 12, 16, 12)
+        outer.setSpacing(10)
+        outer.addLayout(self._top_bar())
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._create_tab(), "Create")
+        self.tabs.addTab(self._review_tab(), "Review")
+        outer.addWidget(self.tabs, 1)
+        activity = QLabel("Activity")
+        activity.setObjectName("activity")
+        outer.addWidget(activity)
+        self.log_box = QPlainTextEdit()
+        self.log_box.setObjectName("log")
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumBlockCount(400)
+        self.log_box.setFixedHeight(88)
+        outer.addWidget(self.log_box)
+
+    def _top_bar(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        title = QLabel("Batch Image Studio")
+        title.setObjectName("title")
+        row.addWidget(title)
+        row.addStretch(1)
+        self.run_spend = QLabel("This run $0.0000 spent")
+        self.run_spend.setObjectName("status")
+        self.folder_total = QLabel("Folder total $0.0000")
+        self.folder_total.setObjectName("status")
+        self.key_label = QLabel("No key")
+        self.key_label.setObjectName("warning")
+        row.addWidget(self.run_spend)
+        row.addWidget(self.folder_total)
+        row.addWidget(self.key_label)
+        self.run_spend.setToolTip(
+            "The meter uses published GPT Image 2.5 token rates ($5 text input, $8 image input, $30 image output per million) "
+            "and published GPT-5.4 review rates. The OpenAI invoice is the authority if prices change."
+        )
+        return row
+
+    def _create_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.addWidget(self._settings_panel())
+        splitter.addWidget(self._work_panel())
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([420, 760])
+        layout.addWidget(splitter, 1)
+        bar = QHBoxLayout()
+        self.generate_button = QPushButton("Generate")
+        self.generate_button.clicked.connect(self.on_generate)
+        self.generate_button.setToolTip("Command+Return")
+        self.stop_button = QPushButton("Stop")
+        self.stop_button.setObjectName("stop")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.engine.stop)
+        open_folder = QPushButton("Open output folder")
+        open_folder.setObjectName("secondary")
+        open_folder.clicked.connect(self.open_output)
+        self.generate_button.setObjectName("primary")
+        self.generate_button.setMinimumHeight(38)
+        self.generate_button.setMinimumWidth(148)
+        bar.addStretch(1)
+        bar.addWidget(open_folder)
+        bar.addWidget(self.stop_button)
+        bar.addWidget(self.generate_button)
+        layout.addLayout(bar)
+        return page
+
+    def _settings_panel(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("settings")
+        form = QVBoxLayout(content)
+        form.setContentsMargins(8, 4, 16, 8)
+        form.setSpacing(8)
+        form.addWidget(section("Account"))
+        form.addWidget(QLabel("API key"))
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.setPlaceholderText("Paste your OpenAI API key")
+        form.addWidget(self.key_edit)
+        key_buttons = QHBoxLayout()
+        save_key = QPushButton("Save key")
+        save_key.setObjectName("primary")
+        save_key.clicked.connect(self.on_save_key)
+        remove_key = QPushButton("Remove key")
+        remove_key.setObjectName("secondary")
+        remove_key.clicked.connect(self.on_remove_key)
+        key_buttons.addWidget(save_key)
+        key_buttons.addWidget(remove_key)
+        form.addLayout(key_buttons)
+        form.addWidget(muted("The key is written to .env in this project folder. It is not shown again after you save it."))
+        form.addWidget(section("Generation"))
+        self.model = QComboBox()
+        self.quality = QComboBox()
+        self.size = QComboBox()
+        self.background = QComboBox()
+        for value, label in BACKGROUNDS:
+            self.background.addItem(label, value)
+        self.model.currentIndexChanged.connect(self._model_changed)
+        fill_combo(self.model, IMAGE_MODELS, IMAGE_MODELS[0][0])
+        fields = QFormLayout()
+        fields.setHorizontalSpacing(12)
+        fields.setVerticalSpacing(10)
+        fields.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        fields.addRow("Model", self.model)
+        fields.addRow("Quality", self.quality)
+        fields.addRow("Size", self.size)
+        fields.addRow("Background", self.background)
+        self.candidates_spin = QSpinBox()
+        self.candidates_spin.setRange(1, 8)
+        self.candidates_spin.setValue(4)
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, 8)
+        self.parallel_spin.setValue(2)
+        self.retries_spin = QSpinBox()
+        self.retries_spin.setRange(0, 3)
+        self.retries_spin.setValue(1)
+        self.cap_spin = QSpinBox()
+        self.cap_spin.setRange(1, 500)
+        self.cap_spin.setValue(10)
+        self.cap_spin.setPrefix("$")
+        fields.addRow("Candidates per product", self.candidates_spin)
+        fields.addRow("Parallel requests", self.parallel_spin)
+        fields.addRow("Retries after a rejection", self.retries_spin)
+        fields.addRow("Spend cap", self.cap_spin)
+        form.addLayout(fields)
+        form.addWidget(section("Review"))
+        self.screen_box = QCheckBox("Review each image before a retry")
+        self.screen_box.setChecked(True)
+        form.addWidget(self.screen_box)
+        self.send_criteria = QCheckBox("Send these criteria to the image model as requirements")
+        self.send_criteria.setChecked(True)
+        form.addWidget(self.send_criteria)
+        self.screen_model = QComboBox()
+        fill_combo(self.screen_model, SCREEN_MODELS, SCREEN_MODELS[0][0])
+        form.addWidget(QLabel("Review model"))
+        form.addWidget(self.screen_model)
+        form.addWidget(muted("The image model does not see this text unless the checkbox above is on. Put the scene description in the prompt."))
+        self.criteria = QPlainTextEdit()
+        self.criteria.setPlainText(DEFAULT_CRITERIA.strip())
+        self.criteria.setFixedHeight(160)
+        form.addWidget(self.criteria)
+        form.addWidget(section("Output"))
+        self.folder_button = QPushButton("Choose output folder")
+        self.folder_button.setObjectName("secondary")
+        self.folder_button.clicked.connect(self.choose_folder)
+        self.folder_label = muted(self.output_dir)
+        form.addWidget(self.folder_button)
+        form.addWidget(self.folder_label)
+        form.addStretch(1)
+        for widget in (
+            self.model,
+            self.quality,
+            self.size,
+            self.background,
+            self.screen_model,
+            self.candidates_spin,
+            self.parallel_spin,
+            self.retries_spin,
+            self.cap_spin,
+        ):
+            widget.currentIndexChanged.connect(self.schedule_save) if isinstance(widget, QComboBox) else widget.valueChanged.connect(self.schedule_save)
+        self.screen_box.toggled.connect(self.schedule_save)
+        self.send_criteria.toggled.connect(self.schedule_save)
+        self.criteria.textChanged.connect(self.schedule_save)
+        self.cap_spin.valueChanged.connect(self._cap_changed)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        self._model_changed()
+        return scroll
+
+    def _work_panel(self) -> QScrollArea:
+        content = QWidget()
+        content.setObjectName("work")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(16, 12, 16, 16)
+        layout.setSpacing(8)
+        layout.addWidget(section("Prompt"))
+        self.prompt = QPlainTextEdit()
+        self.prompt.setPlaceholderText("Describe the scene, the product, the lighting, and the framing.")
+        self.prompt.setMinimumHeight(140)
+        self.prompt.textChanged.connect(self.schedule_save)
+        layout.addWidget(self.prompt)
+        clear_prompt = QPushButton("Clear prompt")
+        clear_prompt.setObjectName("secondary")
+        clear_prompt.clicked.connect(self.prompt.clear)
+        layout.addWidget(clear_prompt, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(section("Reference images"))
+        layout.addWidget(muted(
+            "Drop one approved example here. Every product uses it for lighting, framing, and background. "
+            "Leave the product list empty to generate from this prompt and these images only."
+        ))
+        self.references = ImageDrop("Drop the approved example, or any shared reference images.")
+        self.references.changed.connect(self.schedule_save)
+        layout.addWidget(self.references)
+        clear_refs = QPushButton("Clear references")
+        clear_refs.setObjectName("secondary")
+        clear_refs.clicked.connect(self.references.clear_paths)
+        layout.addWidget(clear_refs, 0, Qt.AlignmentFlag.AlignLeft)
+        header = QHBoxLayout()
+        header.addWidget(section("Products"))
+        header.addStretch(1)
+        add = QPushButton("Add product")
+        add.clicked.connect(lambda: self.add_product())
+        import_folder = QPushButton("Import folder")
+        import_folder.setObjectName("secondary")
+        import_folder.clicked.connect(self.import_folder)
+        import_folder.setToolTip("If the folder contains subfolders, each subfolder becomes a product. Otherwise each image becomes a product.")
+        remove_all = QPushButton("Remove all products")
+        remove_all.setObjectName("secondary")
+        remove_all.clicked.connect(self.remove_all_products)
+        header.addWidget(add)
+        header.addWidget(import_folder)
+        header.addWidget(remove_all)
+        layout.addLayout(header)
+        self.product_host = QWidget()
+        self.product_layout = QVBoxLayout(self.product_host)
+        self.product_layout.setContentsMargins(0, 0, 0, 0)
+        self.product_layout.addStretch(1)
+        layout.addWidget(self.product_host)
+        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        return scroll
+
+    def _review_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QHBoxLayout(page)
+        layout.setContentsMargins(0, 8, 0, 0)
+        left = QVBoxLayout()
+        self.filter = QComboBox()
+        self.filter.addItem("All", "all")
+        self.filter.addItem("In progress", "progress")
+        self.filter.addItem("Needs a decision", "decision")
+        self.filter.addItem("Approved", "approved")
+        self.filter.addItem("Rejected", "rejected")
+        self.filter.addItem("Errors", "errors")
+        self.filter.currentIndexChanged.connect(self.apply_filter)
+        left.addWidget(self.filter)
+        self.gallery = QListWidget()
+        self.gallery.setObjectName("gallery")
+        self.gallery.setViewMode(QListWidget.ViewMode.IconMode)
+        self.gallery.setIconSize(QSize(180, 180))
+        self.gallery.setGridSize(QSize(210, 260))
+        self.gallery.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.gallery.setMovement(QListWidget.Movement.Static)
+        self.gallery.setSpacing(8)
+        self.gallery.setWordWrap(True)
+        self.gallery.setUniformItemSizes(True)
+        self.gallery.itemSelectionChanged.connect(self.on_selection)
+        self.gallery.itemDoubleClicked.connect(lambda _item: self.open_selected())
+        left.addWidget(self.gallery, 1)
+        layout.addLayout(left, 3)
+        side_host = QWidget()
+        side_host.setObjectName("work")
+        side = QVBoxLayout(side_host)
+        side.setContentsMargins(16, 12, 12, 12)
+        side.setSpacing(8)
+        self.preview = QLabel("Generated images will appear in the list.")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(280)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        preview_scroll = QScrollArea()
+        preview_scroll.setWidgetResizable(True)
+        preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        preview_scroll.setWidget(self.preview)
+        side.addWidget(preview_scroll, 1)
+        self.detail = muted("Select an image.")
+        side.addWidget(self.detail)
+        self.issues = QPlainTextEdit()
+        self.issues.setReadOnly(True)
+        self.issues.setFixedHeight(80)
+        self.issues.setPlaceholderText("Review notes")
+        side.addWidget(self.issues)
+        self.sent_prompt = QPlainTextEdit()
+        self.sent_prompt.setReadOnly(True)
+        self.sent_prompt.setFixedHeight(90)
+        self.sent_prompt.setPlaceholderText("The prompt sent for this image")
+        side.addWidget(self.sent_prompt)
+        actions = QHBoxLayout()
+        self.approve_button = QPushButton("Approve")
+        self.approve_button.setObjectName("primary")
+        self.approve_button.clicked.connect(self.approve_selected)
+        self.reject_button = QPushButton("Reject")
+        self.reject_button.setObjectName("secondary")
+        self.reject_button.clicked.connect(self.reject_selected)
+        another = QPushButton("Generate another from the original brief")
+        another.setObjectName("secondary")
+        another.clicked.connect(self.another_selected)
+        actions.addWidget(self.approve_button)
+        actions.addWidget(self.reject_button)
+        side.addLayout(actions)
+        side.addWidget(another)
+        side.addWidget(muted("This asks for a new image with the original brief and references. It does not attach the selected image."))
+        self.change_text = QPlainTextEdit()
+        self.change_text.setFixedHeight(70)
+        self.change_text.setPlaceholderText("Describe one change to the selected image. The original brief stays in the request.")
+        side.addWidget(self.change_text)
+        apply_change = QPushButton("Apply a change to this image")
+        apply_change.setObjectName("secondary")
+        apply_change.clicked.connect(self.change_selected)
+        side.addWidget(apply_change)
+        file_row = QHBoxLayout()
+        open_image = QPushButton("Open image")
+        open_image.setObjectName("secondary")
+        open_image.clicked.connect(self.open_selected)
+        reveal = QPushButton("Show in Finder")
+        reveal.setObjectName("secondary")
+        reveal.clicked.connect(self.reveal_selected)
+        file_row.addWidget(open_image)
+        file_row.addWidget(reveal)
+        side.addLayout(file_row)
+        side.addWidget(muted("Approving copies the file into the approved folder. Rejecting leaves the file where it is. The reviewer can miss errors. Your decision is the one that counts."))
+        layout.addWidget(side_host, 2)
+        return page
+
+    def _cap_changed(self, value: int) -> None:
+        self.engine.set_cap(float(value))
+        self.on_spend(self.engine.spent, self.engine.reserved)
+
+    def _model_changed(self, _index: int = 0) -> None:
+        if not hasattr(self, "quality"):
+            return
+        model = str(self.model.currentData() or IMAGE_MODELS[0][0])
+        fill_combo(self.quality, [(item, item) for item in qualities_for(model)], str(self.quality.currentData() or "high"))
+        fill_combo(self.size, [(item, item) for item in sizes_for(model)], str(self.size.currentData() or "1024x1024"))
+        self.schedule_save()
+
+    def schedule_save(self, *_args) -> None:
+        if self._loading:
+            return
+        self._save_timer.start(800)
+
+    def _apply_settings(self, settings: dict) -> None:
+        self.prompt.setPlainText(str(settings.get("prompt") or ""))
+        self.criteria.setPlainText(str(settings.get("criteria") or DEFAULT_CRITERIA.strip()))
+        self.send_criteria.setChecked(bool(settings.get("send_criteria", True)))
+        self.screen_box.setChecked(bool(settings.get("screen", True)))
+        fill_combo(self.model, IMAGE_MODELS, str(settings.get("model") or IMAGE_MODELS[0][0]))
+        self._model_changed()
+        fill_combo(self.quality, [(item, item) for item in qualities_for(str(self.model.currentData()))], str(settings.get("quality") or "high"))
+        fill_combo(self.size, [(item, item) for item in sizes_for(str(self.model.currentData()))], str(settings.get("size") or "1024x1024"))
+        index = self.background.findData(settings.get("background") or "opaque")
+        self.background.setCurrentIndex(index if index >= 0 else 0)
+        fill_combo(self.screen_model, SCREEN_MODELS, str(settings.get("screen_model") or SCREEN_MODELS[0][0]))
+        self.candidates_spin.setValue(int(settings.get("candidates") or 4))
+        self.parallel_spin.setValue(int(settings.get("parallel") or 2))
+        self.retries_spin.setValue(int(settings.get("retries") or 1))
+        self.cap_spin.setValue(int(float(settings.get("spend_cap") or 10)))
+        self.output_dir = str(settings.get("output_dir") or default_output())
+        self.folder_label.setText(self.output_dir)
+        self.references.set_paths([str(path) for path in settings.get("references") or []])
+        for data in settings.get("products") or []:
+            if isinstance(data, dict):
+                self.add_product(data=data, notify=False)
+        self.product_serial = len(self.cards) + 1
+        geometry = str(settings.get("geometry") or "")
+        if geometry:
+            self.restoreGeometry(QByteArray.fromBase64(geometry.encode("ascii")))
+
+    def save_session(self) -> None:
+        if self._loading:
+            return
+        settings = load_settings()
+        settings.update(
+            {
+                "prompt": self.prompt.toPlainText(),
+                "criteria": self.criteria.toPlainText(),
+                "send_criteria": self.send_criteria.isChecked(),
+                "screen": self.screen_box.isChecked(),
+                "references": list(self.references.paths),
+                "products": [card.to_dict() for card in self.cards],
+                "model": self.model.currentData(),
+                "quality": self.quality.currentData(),
+                "size": self.size.currentData(),
+                "background": self.background.currentData(),
+                "candidates": self.candidates_spin.value(),
+                "parallel": self.parallel_spin.value(),
+                "retries": self.retries_spin.value(),
+                "spend_cap": self.cap_spin.value(),
+                "screen_model": self.screen_model.currentData(),
+                "output_dir": self.output_dir,
+                "geometry": bytes(self.saveGeometry().toBase64()).decode("ascii"),
+            }
+        )
+        try:
+            save_settings(settings)
+        except OSError as exc:
+            self.append_log(f"Could not save settings. {exc}")
+
+    def add_product(self, name: str = "", images: list[str] | None = None, data: dict | None = None, notify: bool = True) -> ProductCard:
+        card = ProductCard()
+        card.changed.connect(self.schedule_save)
+        card.remove_requested.connect(self.remove_product)
+        card.cutout_requested.connect(self.run_cutout)
+        if data:
+            card.load_dict(data)
+        else:
+            card.name.setText(name or f"Product {self.product_serial}")
+            self.product_serial += 1
+            if images:
+                card.images.set_paths(images)
+        self.cards.append(card)
+        self.product_layout.insertWidget(self.product_layout.count() - 1, card)
+        if notify:
+            self.schedule_save()
+        return card
+
+    def remove_product(self, card: ProductCard) -> None:
+        if card in self.cards:
+            self.cards.remove(card)
+        card.setParent(None)
+        card.deleteLater()
+        self.schedule_save()
+
+    def remove_all_products(self) -> None:
+        if not self.cards:
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove products",
+            "Remove every product from this window? The image files stay where they are.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for card in list(self.cards):
+            self.remove_product(card)
+
+    def import_folder(self) -> None:
+        directory = QFileDialog.getExistingDirectory(self, "Import products", str(Path.home()))
+        if not directory:
+            return
+        root = Path(directory)
+        subs = [path for path in sorted(root.iterdir()) if path.is_dir() and not path.name.startswith(".") and path.name != "_workspace"]
+        loose = list_images(root)
+        made = 0
+        if subs:
+            for sub in subs:
+                images = list_images(sub)
+                if images:
+                    self.add_product(name=sub.name, images=[str(path) for path in images], notify=False)
+                    made += 1
+            if loose:
+                self.append_log(f"Ignored {len(loose)} image(s) sitting directly in that folder. Subfolders were used as products.")
+        elif loose:
+            for image in loose:
+                self.add_product(name=image.stem, images=[str(image)], notify=False)
+                made += 1
+        self.schedule_save()
+        if made == 0:
+            QMessageBox.information(self, "Import folder", "No images were found in that folder.")
+        else:
+            self.append_log(f"Imported {made} product(s).")
+
+    def run_cutout(self, card: ProductCard, kind: str) -> None:
+        if not card.images.paths:
+            QMessageBox.information(self, "Cutout", "Drop a product photograph on this product first.")
+            return
+        source = Path(card.images.paths[0])
+        dest = CUTOUT_DIR / f"{card.spec_id}.png"
+        tolerance = int(card.tolerance.value())
+
+        def work() -> str:
+            image = load_rgba(source)
+            cut = checker_source(image, kind, tolerance)
+            CUTOUT_DIR.mkdir(parents=True, exist_ok=True)
+            cut.save(dest, "PNG")
+            return str(dest)
+
+        if kind == "rembg":
+            self.append_log("Cutting out the background locally. The first time can take several minutes while the model downloads.")
+        thread = FuncThread(work)
+        thread.succeeded.connect(lambda path, cid=card.spec_id: self.finish_cutout(cid, path))
+        thread.failed.connect(lambda message, cid=card.spec_id: self.fail_cutout(cid, message))
+        thread.finished.connect(lambda thread=thread: self._drop_thread(thread))
+        self._threads.append(thread)
+        card.set_cutout_busy(True)
+        thread.start()
+
+    def _drop_thread(self, thread: FuncThread) -> None:
+        if thread in self._threads:
+            self._threads.remove(thread)
+
+    def _card(self, spec_id: str) -> ProductCard | None:
+        for card in self.cards:
+            if card.spec_id == spec_id:
+                return card
+        return None
+
+    def finish_cutout(self, spec_id: str, path: str) -> None:
+        card = self._card(spec_id)
+        if card is None:
+            return
+        card.set_cutout_busy(False)
+        card.set_cutout(path)
+        self.append_log(f"Cutout ready for {card.name.text().strip() or 'the product'}. Check the preview before generating.")
+
+    def fail_cutout(self, spec_id: str, message: str) -> None:
+        card = self._card(spec_id)
+        if card is not None:
+            card.set_cutout_busy(False)
+        QMessageBox.warning(self, "Cutout", message)
+
+    def choose_folder(self) -> None:
+        if self.engine.is_busy():
+            return
+        path = QFileDialog.getExistingDirectory(self, "Output folder", self.output_dir)
+        if not path:
+            return
+        self.output_dir = path
+        self.folder_label.setText(path)
+        self.load_manifest()
+        self.schedule_save()
+
+    def open_output(self) -> None:
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.output_dir))
+
+    def on_save_key(self) -> None:
+        try:
+            save_api_key(self.key_edit.text())
+        except ValueError as exc:
+            QMessageBox.warning(self, "API key", str(exc))
+            return
+        except OSError as exc:
+            QMessageBox.warning(self, "API key", f"Could not write .env. {exc}")
+            return
+        self.key_edit.clear()
+        self.engine.drop_client()
+        self._key_status()
+        self.append_log("API key saved in .env.")
+
+    def on_remove_key(self) -> None:
+        answer = QMessageBox.question(self, "Remove key", "Remove the API key from .env?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            clear_api_key()
+        except OSError as exc:
+            QMessageBox.warning(self, "API key", str(exc))
+            return
+        self.engine.drop_client()
+        self._key_status()
+        self.append_log("API key removed.")
+
+    def _key_status(self) -> None:
+        if load_api_key():
+            self.key_label.setText("Key saved")
+            self.key_label.setObjectName("muted")
+        else:
+            self.key_label.setText("No key")
+            self.key_label.setObjectName("warning")
+            self.append_log("Put your OpenAI API key in the field and click Save key. It is stored in .env in this folder.")
+        self.key_label.style().unpolish(self.key_label)
+        self.key_label.style().polish(self.key_label)
+
+    def append_log(self, line: str) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self.log_box.appendPlainText(f"{stamp}  {line}")
+        folder = Path(self.output_dir)
+        if folder.exists():
+            try:
+                with (folder / "log.txt").open("a", encoding="utf-8") as handle:
+                    handle.write(f"{stamp}  {line}\n")
+            except OSError:
+                pass
+
+    def on_spend(self, spent: float, reserved: float) -> None:
+        cap = float(self.cap_spin.value()) if hasattr(self, "cap_spin") else 0
+        self.run_spend.setText(f"This run {money(spent)} spent, {money(reserved)} in flight, cap {money(cap)}")
+
+    def on_busy(self, busy: bool) -> None:
+        self.generate_button.setEnabled(not busy)
+        self.stop_button.setEnabled(busy)
+        self.folder_button.setEnabled(not busy)
+
+    def on_idle(self) -> None:
+        was_running = not self.generate_button.isEnabled()
+        self.on_busy(False)
+        if was_running:
+            self.append_log("Ready.")
+
+    def on_generate(self) -> None:
+        if self.engine.is_busy():
+            return
+        if not load_api_key():
+            QMessageBox.warning(self, "API key", "Save an API key first. It is stored in .env in this project folder.")
+            return
+        brief = self.prompt.toPlainText().strip()
+        if not brief:
+            QMessageBox.warning(self, "Prompt", "Write a prompt first.")
+            return
+        products = [card.spec() for card in self.cards]
+        if not products:
+            products = [
+                ProductSpec(
+                    id="batch",
+                    name="Batch",
+                    notes="",
+                    mode="reference",
+                    scale=0.62,
+                    image_paths=(),
+                    mask_path=None,
+                    cutout_path=None,
+                )
+            ]
+        problems = self._prepare_products(products)
+        if problems:
+            QMessageBox.warning(self, "Generate", problems)
+            return
+        context = self._context(brief)
+        cap = float(self.cap_spin.value())
+        n_approved = len(context.approved_paths)
+        wave = 0.0
+        largest = 0.0
+        for product in products:
+            incoming = self._input_count(product, n_approved)
+            size = context.size
+            if product.mode == "lock" and product.image_paths:
+                try:
+                    size = locked_output_size(Path(product.image_paths[0]))
+                except Exception:
+                    size = context.size
+            image_cost = estimate_image_call(context.quality, size, incoming)
+            screen_images = 1 + min(4, len(product.image_paths)) + min(2, n_approved)
+            review_cost = estimate_screen_call(context.screen_model, screen_images) if context.screen and context.criteria.strip() else 0
+            largest = max(largest, image_cost)
+            wave += context.candidates * (image_cost + review_cost)
+        if largest > cap:
+            QMessageBox.warning(
+                self,
+                "Spend cap",
+                f"The allowance held for one image is {money(largest)}. The cap is {money(cap)}. "
+                "Raise the cap, or choose a lower quality or a smaller size.",
+            )
+            return
+        retries = context.retries
+        ceiling = wave * (1 + retries)
+        screen_line = "Review is on." if context.screen and context.criteria.strip() else "Review is off, or the criteria box is empty. Nothing will be rejected automatically."
+        answer = QMessageBox.question(
+            self,
+            "Generate images",
+            (
+                f"This can request up to {len(products) * context.candidates} images before retries.\n"
+                f"Allowance held before retries and review settle: about {money(wave)}.\n"
+                f"If every image uses every retry, the allowance could reach about {money(ceiling)}.\n"
+                f"The cap is {money(cap)}. The run stops when the cap is reached.\n"
+                f"{screen_line}\n"
+                "The reviewer can miss errors. Approve the images yourself.\n"
+                "The OpenAI invoice is the authority. API use is billed separately from ChatGPT."
+            ),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.engine.parallel = context.parallel
+        try:
+            self.engine.start_batch(context, products)
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "Generate", str(exc))
+
+    def _prepare_products(self, products: list[ProductSpec]) -> str:
+        problems: list[str] = []
+        seen: set[str] = set()
+        for product in products:
+            if product.id in seen:
+                problems.append(f"{product.name}: this product is listed twice. Remove it and add it again.")
+            seen.add(product.id)
+            if product.mode == "lock":
+                problems.extend(self._lock_problems(product))
+            elif product.mode == "composite":
+                problems.extend(self._composite_problems(product))
+        if len(problems) > 12:
+            hidden = len(problems) - 12
+            problems = problems[:12]
+            problems.append(f"{hidden} more.")
+        return "\n".join(problems)
+
+    def _lock_problems(self, product: ProductSpec) -> list[str]:
+        if not product.image_paths:
+            return [f"{product.name}: add the product photograph before locking pixels."]
+        if product.mask_path:
+            return []
+        if product.cutout_path:
+            try:
+                cutout = load_rgba(Path(product.cutout_path))
+            except Exception as exc:
+                return [f"{product.name}: could not read the cutout. {exc}"]
+            if not is_cutout(cutout):
+                return [f"{product.name}: the cutout has no transparent backdrop."]
+            return []
+        try:
+            image = load_rgba(Path(product.image_paths[0]))
+        except Exception as exc:
+            return [f"{product.name}: could not read the photograph. {exc}"]
+        if is_cutout(image):
+            return [f"{product.name}: this file is a cutout. Use New scene, paste product."]
+        return [f"{product.name}: create a cutout or choose a mask before locking pixels."]
+
+    def _composite_problems(self, product: ProductSpec) -> list[str]:
+        path = product.cutout_path or (product.image_paths[0] if product.image_paths else "")
+        if not path:
+            return [f"{product.name}: add a product photograph, then create a cutout."]
+        try:
+            image = load_rgba(Path(path))
+        except Exception as exc:
+            return [f"{product.name}: could not read the photograph. {exc}"]
+        if not is_cutout(image):
+            return [
+                f"{product.name}: create a cutout, or use a PNG that already has transparency, before pasting the product."
+            ]
+        return []
+
+    def _context(self, brief: str) -> RunContext:
+        criteria = self.criteria.toPlainText().strip()
+        return RunContext(
+            brief=brief,
+            requirements=criteria if self.send_criteria.isChecked() else "",
+            criteria=criteria,
+            approved_paths=tuple(self.references.paths),
+            model=str(self.model.currentData()),
+            quality=str(self.quality.currentData()),
+            size=str(self.size.currentData()),
+            background=str(self.background.currentData()),
+            output_dir=self.output_dir,
+            screen=self.screen_box.isChecked(),
+            screen_model=str(self.screen_model.currentData()),
+            retries=int(self.retries_spin.value()),
+            parallel=int(self.parallel_spin.value()),
+            candidates=int(self.candidates_spin.value()),
+            run_id=uuid.uuid4().hex[:8],
+        )
+
+    def _input_count(self, product: ProductSpec, n_approved: int) -> int:
+        if product.mode == "composite":
+            return min(16, n_approved)
+        return min(16, len(product.image_paths) + n_approved)
+
+    def on_candidate(self, record: dict) -> None:
+        cid = str(record.get("id") or "")
+        if not cid:
+            return
+        existing = self.candidates.get(cid)
+        if existing and existing.get("status") in {"approved", "rejected"}:
+            record["status"] = existing["status"]
+            if existing.get("approved_path"):
+                record["approved_path"] = existing["approved_path"]
+        self.candidates[cid] = record
+        if cid not in self.order:
+            self.order.append(cid)
+        self._paint_item(record)
+        self.save_manifest()
+        self.refresh_totals()
+        self._review_title()
+        if self._selected_id() == cid:
+            self.show_record(record)
+
+    def _paint_item(self, record: dict) -> None:
+        cid = str(record["id"])
+        item = self.items.get(cid)
+        if item is None:
+            item = QListWidgetItem()
+            item.setData(Qt.ItemDataRole.UserRole, cid)
+            item.setSizeHint(QSize(200, 250))
+            self.gallery.addItem(item)
+            self.items[cid] = item
+        kind = str(record.get("kind") or "fresh")
+        if kind == "fresh":
+            title = f"Candidate {int(record.get('index') or 0) + 1}"
+        elif kind == "retry":
+            title = f"Retry {int(record.get('attempt') or 1)}"
+        elif kind == "change":
+            title = "Change"
+        else:
+            title = "New from brief"
+        status = str(record.get("status") or "generating")
+        item.setText(f"{record.get('product_name') or 'Image'}\n{title}\n{STATUS_TITLES.get(status, status)}")
+        item.setForeground(QColor(STATUS_COLORS.get(status, "#1d1b18")))
+        icon = thumbnail_pixmap(str(record.get("path") or ""), 180)
+        if not icon.isNull():
+            item.setIcon(QIcon(icon))
+        self.apply_filter_to(item, status)
+
+    def apply_filter(self, _index: int = 0) -> None:
+        for cid, item in self.items.items():
+            status = str(self.candidates.get(cid, {}).get("status") or "")
+            self.apply_filter_to(item, status)
+
+    def apply_filter_to(self, item: QListWidgetItem, status: str) -> None:
+        choice = str(self.filter.currentData() or "all")
+        groups = {
+            "all": None,
+            "progress": {"generating", "reviewing"},
+            "decision": {"passed", "failed", "unreviewed"},
+            "approved": {"approved"},
+            "rejected": {"rejected"},
+            "errors": {"error", "cap"},
+        }
+        allowed = groups.get(choice)
+        item.setHidden(allowed is not None and status not in allowed)
+
+    def _review_title(self) -> None:
+        waiting = sum(1 for record in self.candidates.values() if record.get("status") in {"passed", "failed", "unreviewed"})
+        self.tabs.setTabText(1, f"Review ({waiting})" if waiting else "Review")
+
+    def load_manifest(self) -> None:
+        self.gallery.clear()
+        self.items.clear()
+        self.candidates.clear()
+        self.order.clear()
+        path = Path(self.output_dir) / "manifest.json"
+        if path.is_file():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                self.append_log("Could not read manifest.json in the output folder.")
+                payload = {}
+            for record in payload.get("candidates") or []:
+                if not isinstance(record, dict) or not record.get("id"):
+                    continue
+                normalized = self._normalize_loaded(record)
+                cid = str(normalized["id"])
+                self.order.append(cid)
+                self.candidates[cid] = normalized
+                self._paint_item(normalized)
+        self.refresh_totals()
+        self._review_title()
+        self.show_record(None)
+
+    def _normalize_loaded(self, record: dict) -> dict:
+        status = str(record.get("status") or "")
+        path = str(record.get("path") or "")
+        if status in {"generating", "reviewing"} and not path:
+            record["status"] = "error"
+            record["error"] = "This run was interrupted before the image was saved."
+        elif status == "reviewing" and path:
+            record["status"] = "unreviewed"
+        record["issues"] = list(record.get("issues") or [])
+        return record
+
+    def save_manifest(self) -> None:
+        folder = Path(self.output_dir)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            payload = {"version": 1, "candidates": [self.candidates[cid] for cid in self.order if cid in self.candidates]}
+            atomic_write(folder / "manifest.json", json.dumps(payload, indent=2))
+        except OSError as exc:
+            self.append_log(f"Could not write manifest.json. {exc}")
+
+    def refresh_totals(self) -> None:
+        total = sum(float(record.get("cost") or 0) for record in self.candidates.values())
+        self.folder_total.setText(f"Folder total {money(total)}")
+
+    def _selected_id(self) -> str:
+        items = self.gallery.selectedItems()
+        if not items:
+            return ""
+        return str(items[0].data(Qt.ItemDataRole.UserRole) or "")
+
+    def current(self) -> dict | None:
+        cid = self._selected_id()
+        if not cid:
+            return None
+        return self.candidates.get(cid)
+
+    def on_selection(self) -> None:
+        self.show_record(self.current())
+
+    def show_record(self, record: dict | None) -> None:
+        self.preview_pix = QPixmap()
+        if not record:
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText("Generated images will appear in the list.")
+            self.detail.setText("Select an image.")
+            self.issues.clear()
+            self.sent_prompt.clear()
+            return
+        path = str(record.get("path") or "")
+        if path and Path(path).is_file():
+            self.preview_pix = QPixmap(path)
+            self.preview.setText("")
+            self._scale_preview()
+        else:
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText(str(record.get("error") or "No image file yet."))
+        status = STATUS_TITLES.get(str(record.get("status") or ""), str(record.get("status") or ""))
+        bits = [
+            str(record.get("product_name") or ""),
+            status,
+            str(record.get("model") or ""),
+            money(float(record.get("cost") or 0)),
+        ]
+        if record.get("approved_path"):
+            bits.append("Copied to the approved folder")
+        if record.get("notes"):
+            bits.append(str(record["notes"]))
+        if record.get("error") and record.get("status") not in {"generating", "reviewing"}:
+            bits.append(str(record["error"]))
+        self.detail.setText("\n".join(bit for bit in bits if bit))
+        issues = list(record.get("issues") or [])
+        instruction = str(record.get("instruction") or "")
+        text = "\n".join(issues)
+        if instruction and instruction not in text and (
+            record.get("kind") in {"retry", "change"} or str(record.get("status")) == "failed"
+        ):
+            text = (text + "\n\n" if text else "") + "Instruction sent with this request:\n" + instruction
+        self.issues.setPlainText(text)
+        self.sent_prompt.setPlainText(str(record.get("prompt") or ""))
+        mode = str(record.get("mode") or "")
+        if mode == "lock":
+            self.change_text.setPlaceholderText("This can change the scene. The product pixels stay in place.")
+        elif mode == "composite":
+            self.change_text.setPlaceholderText("This changes the scene. The product is pasted again and is not redrawn. Scale stays as it was.")
+        else:
+            self.change_text.setPlaceholderText("Describe one change. The original brief stays in the request.")
+
+    def _scale_preview(self) -> None:
+        if self.preview_pix.isNull():
+            return
+        width = max(240, self.preview.width() - 12)
+        self.preview.setPixmap(self.preview_pix.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._scale_preview()
+
+    def approve_selected(self) -> None:
+        record = self.current()
+        if not record:
+            return
+        path = str(record.get("path") or "")
+        if not path or not Path(path).is_file():
+            QMessageBox.information(self, "Approve", "This image has no file yet.")
+            return
+        dest_dir = Path(str(record.get("output_dir") or self.output_dir)) / "approved" / safe_slug(str(record.get("product_name") or "image"))
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / Path(path).name
+            shutil.copy2(path, dest)
+        except OSError as exc:
+            QMessageBox.warning(self, "Approve", str(exc))
+            return
+        record["status"] = "approved"
+        record["approved_path"] = str(dest)
+        self.engine.note_decision(str(record.get("id") or ""))
+        self.on_candidate(record)
+        self.append_log(f"Approved {Path(path).name}.")
+
+    def reject_selected(self) -> None:
+        record = self.current()
+        if not record:
+            return
+        record["status"] = "rejected"
+        self.engine.note_decision(str(record.get("id") or ""))
+        self.on_candidate(record)
+
+    def another_selected(self) -> None:
+        record = self.current()
+        if not record:
+            return
+        self.engine.request_another(record)
+
+    def change_selected(self) -> None:
+        record = self.current()
+        if not record:
+            return
+        self.engine.request_change(record, self.change_text.toPlainText())
+
+    def open_selected(self) -> None:
+        record = self.current()
+        path = str(record.get("path") or "") if record else ""
+        if path and Path(path).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def reveal_selected(self) -> None:
+        record = self.current()
+        path = str(record.get("path") or "") if record else ""
+        if path and Path(path).is_file():
+            subprocess.run(["open", "-R", path], check=False)
+
+    def closeEvent(self, event) -> None:
+        self.save_session()
+        if self.engine.is_busy():
+            answer = QMessageBox.question(
+                self,
+                "Stop the run",
+                "Images are still being generated. Stop them and close?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.engine.blockSignals(True)
+            self.engine.shutdown(wait=False)
+            event.accept()
+            QTimer.singleShot(50, lambda: os._exit(0))
+            return
+        self.engine.shutdown(wait=True)
+        event.accept()
+
+
+def checker_source(image: Image.Image, kind: str, tolerance: int) -> Image.Image:
+    from .imaging import flood_cutout, rembg_cutout
+
+    if kind == "plain":
+        return flood_cutout(image, tolerance)
+    return rembg_cutout(image)
