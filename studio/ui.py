@@ -642,7 +642,11 @@ class ProductCard(QFrame):
     def _mode_changed(self, _index: int = 0) -> None:
         mode = self.mode.currentData()
         self.mode_help.setText(MODE_HELP.get(mode, ""))
-        self.scale.setVisible(mode in {"composite", "inset"})
+        self.scale.setVisible(mode in {"composite", "inset", "stage"})
+        if mode == "stage":
+            self.scale.setToolTip("Size of the open center. 0.62 opens the middle 62 percent of the width and the height.")
+        else:
+            self.scale.setToolTip("How tall the pasted product is, as a fraction of the picture. 0.62 means 62 percent of the height.")
         self.changed.emit()
 
     def _choose_mask(self) -> None:
@@ -977,6 +981,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(muted(
             "Drop one approved example here. Every product uses it for lighting, framing, and background. "
             "For Use my scene, paste product, the first image here is the scene you already have. It is not redrawn. "
+            "For Generate product in my scene, that first image is the scene that stays, and the photographs on the product card are what the model draws from. "
             "Leave the product list empty to generate from this prompt and these images only."
         ))
         self.references = ImageDrop("Drop the approved example, or any shared reference images.")
@@ -1437,6 +1442,11 @@ class MainWindow(QMainWindow):
                     size = locked_output_size(Path(product.image_paths[0]))
                 except Exception:
                     size = context.size
+            elif product.mode == "stage" and self.references.paths:
+                try:
+                    size = locked_output_size(Path(self.references.paths[0]))
+                except Exception:
+                    size = context.size
             image_cost = 0.0 if product.mode == "inset" else estimate_image_call(context.quality, size, incoming)
             screen_images = 1 + min(4, len(product.image_paths)) + min(2, n_approved)
             review_cost = estimate_screen_call(context.screen_model, screen_images) if context.screen and context.criteria.strip() else 0
@@ -1458,6 +1468,11 @@ class MainWindow(QMainWindow):
             paste_line = (
                 "Use my scene, paste product does not send an image request. "
                 "One picture is saved for each of those products, using the first reference image as the scene.\n"
+            )
+        if any(product.mode == "stage" for product in products):
+            paste_line += (
+                "Generate product in my scene keeps the first reference image outside the center "
+                "and asks the model to draw a new product there.\n"
             )
         answer = QMessageBox.question(
             self,
@@ -1494,6 +1509,8 @@ class MainWindow(QMainWindow):
                 problems.extend(self._composite_problems(product))
             elif product.mode == "inset":
                 problems.extend(self._inset_problems(product))
+            elif product.mode == "stage":
+                problems.extend(self._stage_problems(product))
         if len(problems) > 12:
             hidden = len(problems) - 12
             problems = problems[:12]
@@ -1564,11 +1581,23 @@ class MainWindow(QMainWindow):
         problems.extend(self._composite_problems(product))
         return problems
 
+    def _stage_problems(self, product: ProductSpec) -> list[str]:
+        problems: list[str] = []
+        if not self.references.paths:
+            problems.append(
+                f"{product.name}: drop the scene you already have into Reference images. The first image is the one that stays."
+            )
+        if not product.image_paths:
+            problems.append(f"{product.name}: add photographs of the product the model should draw.")
+        return problems
+
     def _input_count(self, product: ProductSpec, n_approved: int) -> int:
         if product.mode == "inset":
             return 0
         if product.mode == "composite":
             return min(16, n_approved)
+        if product.mode == "stage":
+            return min(16, (1 if n_approved else 0) + len(product.image_paths))
         return min(16, len(product.image_paths) + n_approved)
 
     def on_candidate(self, record: dict) -> None:
@@ -1748,6 +1777,8 @@ class MainWindow(QMainWindow):
             self.change_text.setPlaceholderText("This changes the scene. The product is pasted again and is not redrawn. Scale stays as it was.")
         elif mode == "inset":
             self.change_text.setPlaceholderText("This picture is a paste. Change Height and generate again. A text change cannot move the product.")
+        elif mode == "stage":
+            self.change_text.setPlaceholderText("This can change the product in the center. The scene outside that center stays.")
         else:
             self.change_text.setPlaceholderText("Describe one change. The original brief stays in the request.")
 

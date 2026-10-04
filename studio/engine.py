@@ -26,6 +26,7 @@ from PySide6.QtCore import QObject, Signal
 
 from .config import atomic_write
 from .imaging import (
+    center_protect,
     composite_product,
     data_url,
     encode_reference,
@@ -40,6 +41,7 @@ from .imaging import (
     protect_from_user_mask,
     resize_exact,
     restore_pixels,
+    soften_protect,
     safe_slug,
 )
 from .pricing import cost_from_image_usage, cost_from_text_usage, estimate_image_call, estimate_screen_call
@@ -176,6 +178,25 @@ def build_prompt(
         parts.append(
             "The scene already exists and must stay as it is. Do not draw a new scene or a new product."
         )
+    elif mode == "stage":
+        if editing:
+            parts.append(
+                "The first image is the picture to edit. Change the product in the open center only. "
+                "Do not redesign the scene outside that center. Those pixels will be put back after this request."
+            )
+            parts.append(
+                "Images after the first include the original scene and the appearance photographs. "
+                "Draw a new product that resembles the photographs. Do not paste or copy those photographs into the scene."
+            )
+        else:
+            parts.append(
+                "The first image is the scene to keep. Draw the product in the open center only. "
+                "Do not redesign the scene outside that center. Those pixels will be put back after this request."
+            )
+            parts.append(
+                "The later attached images are photographs for appearance. Create a new product that resembles them. "
+                "Do not paste, trace, or copy those photographs into the scene."
+            )
     elif has_product and has_approved:
         parts.append(
             "Product photographs define the product's shape, color, label, and geometry. "
@@ -205,19 +226,39 @@ def build_prompt(
     return "\n\n".join(parts)
 
 
-def _screen_text(criteria: str, brief: str, notes: str, requirements: str, n_product: int, n_approved: int) -> str:
+def _screen_text(
+    criteria: str,
+    brief: str,
+    notes: str,
+    requirements: str,
+    n_product: int,
+    n_approved: int,
+    mode: str = "",
+) -> str:
     lines = ["Judge the candidate image.", "Image 1 is the candidate."]
     next_index = 2
     if n_product:
         end = next_index + n_product - 1
-        if n_product == 1:
+        if mode == "stage":
+            if n_product == 1:
+                lines.append(f"Image {next_index} is an appearance photograph. The product should resemble it. It is not a file to paste.")
+            else:
+                lines.append(
+                    f"Images {next_index} through {end} are appearance photographs. The product should resemble them. They are not files to paste."
+                )
+        elif n_product == 1:
             lines.append(f"Image {next_index} is a photograph of the real product.")
         else:
             lines.append(f"Images {next_index} through {end} are photographs of the real product.")
         next_index = end + 1
     if n_approved:
         end = next_index + n_approved - 1
-        if n_approved == 1:
+        if mode == "stage":
+            if n_approved == 1:
+                lines.append(f"Image {next_index} is the original scene. The scene outside the center should still match it.")
+            else:
+                lines.append(f"Images {next_index} through {end} include the original scene. The scene outside the center should still match it.")
+        elif n_approved == 1:
             lines.append(f"Image {next_index} is the approved example for lighting, framing, and background.")
         else:
             lines.append(
@@ -239,7 +280,12 @@ def _screen_text(criteria: str, brief: str, notes: str, requirements: str, n_pro
     lines.append("Criteria:")
     lines.append(criteria.strip())
     lines.append("Report only problems that are visible.")
-    if n_product:
+    if mode == "stage" and n_product:
+        lines.append(
+            "The product in the center was drawn to resemble the photographs. Do not reject it only because it is not a copy of a photograph."
+        )
+        lines.append("Reject it when the scene outside the center changed, or when the product misses a resemblance the criteria name.")
+    elif n_product:
         lines.append(
             "If a label in a product photograph is readable and the candidate label is missing, wrong, or unreadable, reject the candidate."
         )
@@ -516,6 +562,8 @@ class Engine(QObject):
             images = len(context.approved_paths)
         elif product.mode == "inset":
             images = 0
+        elif product.mode == "stage":
+            images = 1 + len(product.image_paths)
         else:
             images = len(product.image_paths) + len(context.approved_paths)
         size = context.size
@@ -523,6 +571,11 @@ class Engine(QObject):
             try:
                 scene = load_rgba(Path(context.approved_paths[0]))
                 size = f"{scene.width}x{scene.height}"
+            except Exception:
+                size = context.size
+        if product.mode == "stage" and context.approved_paths:
+            try:
+                size = locked_output_size(Path(context.approved_paths[0]))
             except Exception:
                 size = context.size
         if product.mode == "lock" and product.image_paths:
@@ -900,6 +953,43 @@ class Engine(QObject):
                 f"{product.name}: your scene is kept. The cutout is pasted at height {float(product.scale):.2f}. "
                 "The image model is not asked to draw the scene or the product."
             )
+        elif mode == "stage":
+            if not context.approved_paths:
+                raise RuntimeError(f"{product.name}: drop the scene you already have into Reference images.")
+            if not product.image_paths:
+                raise RuntimeError(f"{product.name}: add photographs of the product the model should draw.")
+            scene = load_rgba(Path(context.approved_paths[0]))
+            src_w, src_h = scene.size
+            width, height = legal_size(src_w, src_h)
+            if (width, height) != (src_w, src_h):
+                warnings.append(
+                    f"{product.name}: the scene was resized from {src_w}×{src_h} to {width}×{height} "
+                    "so the API would accept it. The pixels put back are that resized scene, not a redraw."
+                )
+            scene = resize_exact(scene, width, height)
+            protect = center_protect(width, height, product.scale)
+            size = f"{width}x{height}"
+            restore_name = "restore.png"
+            protect_name = "protect.png"
+            mask_name = "mask.png"
+            (workspace / restore_name).write_bytes(png_bytes(scene))
+            (workspace / protect_name).write_bytes(png_bytes(protect))
+            (workspace / mask_name).write_bytes(openai_mask_bytes(protect))
+            scene_upload = self._store_bytes(workspace, "upload_00", png_bytes(scene), ".png")
+            uploads.append(scene_upload)
+            approved_files.append(scene_upload)
+            for path in product.image_paths:
+                stored = self._store_reference(workspace, f"upload_{len(uploads):02d}", Path(path))
+                product_files.append(stored)
+                uploads.append(stored)
+            if len(context.approved_paths) > 1:
+                warnings.append(f"{product.name}: only the first reference image is used as the scene.")
+            if product.mask_path:
+                warnings.append(f"{product.name}: the mask on this card is not used. Height sets the open center.")
+            warnings.append(
+                f"{product.name}: the scene stays outside the center. Height {float(product.scale):.2f} "
+                "opens the middle of the scene. The model draws a new product there from the photographs on the card."
+            )
         else:
             for path in product.image_paths:
                 product_files.append(self._store_reference(workspace, f"upload_{len(uploads):02d}", Path(path)))
@@ -1006,7 +1096,7 @@ class Engine(QObject):
         current = Path(job.parent_path).read_bytes()
         uploads = [("current.png", current, "image/png"), *stored]
         mask = None
-        if meta.get("mode") == "lock" and meta.get("protect"):
+        if meta.get("mode") in {"lock", "stage"} and meta.get("protect"):
             with Image.open(BytesIO(current)) as current_image:
                 size = current_image.size
             protect = load_rgba(workspace / str(meta["protect"])).convert("L")
@@ -1031,7 +1121,9 @@ class Engine(QObject):
             kwargs["image"] = uploads
             if mask is not None:
                 kwargs["mask"] = mask
-            if not model.startswith("gpt-image-2") or model.startswith("gpt-image-2.5"):
+            if str(meta.get("mode") or "") != "stage" and (
+                not model.startswith("gpt-image-2") or model.startswith("gpt-image-2.5")
+            ):
                 kwargs["input_fidelity"] = "high"
             result = self._call(lambda: self._edit_or_drop_fidelity(client, kwargs))
         else:
@@ -1057,11 +1149,13 @@ class Engine(QObject):
     def _postprocess(self, job: Job, meta: dict, raw: bytes) -> tuple[Image.Image, Path | None]:
         workspace = Path(job.workspace)
         mode = str(meta.get("mode") or "reference")
-        if mode == "lock" and meta.get("restore") and meta.get("protect"):
+        if mode in {"lock", "stage"} and meta.get("restore") and meta.get("protect"):
             original = load_rgba(workspace / str(meta["restore"]))
             with Image.open(workspace / str(meta["protect"])) as protect_image:
                 protect = protect_image.convert("L")
                 protect.load()
+            if mode == "stage":
+                protect = soften_protect(protect)
             with Image.open(BytesIO(raw)) as generated:
                 if job.kind == "change" and generated.size != original.size:
                     protect = protect.resize(generated.size, Image.Resampling.NEAREST)
@@ -1177,6 +1271,7 @@ class Engine(QObject):
                         str(meta.get("requirements") or ""),
                         len(product_files),
                         len(approved_files),
+                        str(meta.get("mode") or ""),
                     ),
                 }
             ]

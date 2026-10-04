@@ -160,6 +160,21 @@ def protect_from_user_mask(mask: Image.Image, size: tuple[int, int]) -> Image.Im
     return Image.fromarray(protect, mode="L")
 
 
+def center_protect(width: int, height: int, scale: float) -> Image.Image:
+    fraction = min(0.90, max(0.15, float(scale)))
+    box_w = min(width, max(16, int(round(width * fraction))))
+    box_h = min(height, max(16, int(round(height * fraction))))
+    x0 = max(0, (width - box_w) // 2)
+    y0 = max(0, (height - box_h) // 2)
+    band = np.full((height, width), 255, dtype=np.uint8)
+    band[y0 : y0 + box_h, x0 : x0 + box_w] = 0
+    return Image.fromarray(band, mode="L")
+
+
+def soften_protect(protect: Image.Image, radius: float = 8) -> Image.Image:
+    return protect.convert("L").filter(ImageFilter.GaussianBlur(radius))
+
+
 def openai_mask_bytes(protect: Image.Image) -> bytes:
     band = protect.convert("L")
     alpha = np.array(band, dtype=np.uint8)

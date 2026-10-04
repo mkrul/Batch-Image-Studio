@@ -76,6 +76,8 @@ New scene, paste product asks the model for a scene and tells it not to draw the
 
 Use my scene, paste product is for a scene you already have. Drop that scene into Reference images. The first image is kept and is not redrawn. Create a cutout on the product card. Height is the product height as a fraction of that scene. 0.62 means 62 percent of the scene height. The product is centered and sits near the bottom. If it would be wider than about 86 percent of the frame, it is shrunk. The image model is not called, and one picture is saved per product. A text correction cannot move the product. Change Height and generate again. If review is off, this mode does not need an API key. If review is on, the reviewer still calls the API.
 
+Generate product in my scene keeps that same first reference image, but it does not paste a cutout. Put the photographs you want the new product to resemble on the product card. Height opens the center: 0.62 is the middle 62 percent of the width and the height. The model draws a new product there. Afterward the program puts your scene pixels back outside that center. This is a normal image request, so candidates, parallel requests, and the spend cap apply. A later text change can alter the product in the center. It does not replace the scene outside it. A cutout is not required. If the scene size is not one the API accepts, it is resized first, and the pixels put back are that resized scene.
+
 Cut out plain background is for a product on a plain backdrop. It only changes transparency. Check the checkerboard preview. Cut out complex background uses the optional local `rembg` model and does not send the photograph to OpenAI. Install it with:
 
 ```bash
