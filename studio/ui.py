@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PIL import Image
-from PySide6.QtCore import QByteArray, QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import QByteArray, QEvent, QSize, Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QIcon, QImage, QImageReader, QKeySequence, QPalette, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -389,6 +389,38 @@ class DoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 
+class PlainText(QPlainTextEdit):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.viewport().installEventFilter(self)
+
+    def _release_wheel(self, event) -> bool:
+        if not _keyboard_selected(self):
+            return True
+        bar = self.verticalScrollBar()
+        delta = event.angleDelta().y() or event.pixelDelta().y()
+        if bar.maximum() <= bar.minimum():
+            return True
+        if delta > 0 and bar.value() <= bar.minimum():
+            return True
+        if delta < 0 and bar.value() >= bar.maximum():
+            return True
+        return False
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.viewport() and event.type() == QEvent.Type.Wheel and self._release_wheel(event):
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
+
+    def wheelEvent(self, event) -> None:
+        if self._release_wheel(event):
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
+
 def narrow_combo(combo: QComboBox) -> None:
     combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
     combo.setMinimumContentsLength(14)
@@ -591,7 +623,7 @@ class ProductCard(QFrame):
         remove.clicked.connect(lambda: self.remove_requested.emit(self))
         header.addWidget(remove)
         layout.addLayout(header)
-        self.notes = QPlainTextEdit()
+        self.notes = PlainText()
         self.notes.setPlaceholderText("Optional instructions for this product only")
         self.notes.setFixedHeight(52)
         layout.addWidget(self.notes)
@@ -824,6 +856,7 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_tab(), "Create")
         self.tabs.addTab(self._review_tab(), "Review")
+        self.tabs.currentChanged.connect(self._on_tab)
         outer.addWidget(self.tabs, 1)
         activity = QLabel("Activity")
         activity.setObjectName("activity")
@@ -966,7 +999,7 @@ class MainWindow(QMainWindow):
         form.addWidget(QLabel("Review model"))
         form.addWidget(self.screen_model)
         form.addWidget(muted("The image model does not see this text unless the checkbox above is on. Put the scene description in the prompt."))
-        self.criteria = QPlainTextEdit()
+        self.criteria = PlainText()
         self.criteria.setPlainText(DEFAULT_CRITERIA.strip())
         self.criteria.setFixedHeight(120)
         form.addWidget(self.criteria)
@@ -1009,7 +1042,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(16, 12, 16, 16)
         layout.setSpacing(8)
         layout.addWidget(section("Prompt"))
-        self.prompt = QPlainTextEdit()
+        self.prompt = PlainText()
         self.prompt.setPlaceholderText("Describe the scene, the product, the lighting, and the framing.")
         self.prompt.setMinimumHeight(100)
         self.prompt.textChanged.connect(self.schedule_save)
@@ -1096,22 +1129,21 @@ class MainWindow(QMainWindow):
         side.setContentsMargins(16, 12, 12, 12)
         side.setSpacing(8)
         self.preview = QLabel("Generated images will appear in the list.")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(280)
-        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        preview_scroll = QScrollArea()
-        preview_scroll.setWidgetResizable(True)
-        preview_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        preview_scroll.setWidget(self.preview)
-        side.addWidget(preview_scroll, 1)
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+        self.preview.setWordWrap(True)
+        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        side.addWidget(self.preview)
         self.detail = muted("Select an image.")
         side.addWidget(self.detail)
-        self.issues = QPlainTextEdit()
-        self.issues.setReadOnly(True)
+        self.issues = PlainText()
         self.issues.setFixedHeight(80)
         self.issues.setPlaceholderText("Review notes")
+        self.issues.textChanged.connect(self._review_notes_edited)
         side.addWidget(self.issues)
-        self.sent_prompt = QPlainTextEdit()
+        self._notes_timer = QTimer(self)
+        self._notes_timer.setSingleShot(True)
+        self._notes_timer.timeout.connect(self.save_manifest)
+        self.sent_prompt = PlainText()
         self.sent_prompt.setReadOnly(True)
         self.sent_prompt.setFixedHeight(90)
         self.sent_prompt.setPlaceholderText("The prompt sent for this image")
@@ -1131,7 +1163,7 @@ class MainWindow(QMainWindow):
         side.addLayout(actions)
         side.addWidget(another)
         side.addWidget(muted("This asks for a new image with the original brief and references. It does not attach the selected image."))
-        self.change_text = QPlainTextEdit()
+        self.change_text = PlainText()
         self.change_text.setFixedHeight(70)
         self.change_text.setPlaceholderText("Describe one change to the selected image. The original brief stays in the request.")
         side.addWidget(self.change_text)
@@ -1150,8 +1182,19 @@ class MainWindow(QMainWindow):
         file_row.addWidget(reveal)
         side.addLayout(file_row)
         side.addWidget(muted("Approving copies the file into the approved folder. Rejecting leaves the file where it is. The reviewer can miss errors. Your decision is the one that counts."))
-        layout.addWidget(side_host, 2)
+        self.review_scroll = QScrollArea()
+        self.review_scroll.setWidgetResizable(True)
+        self.review_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.review_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.review_scroll.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self.review_scroll.setWidget(side_host)
+        layout.addWidget(self.review_scroll, 2)
         return page
+
+    def _on_tab(self, index: int) -> None:
+        if self.tabs.widget(index) is self.review_scroll.parentWidget():
+            self._scale_preview()
+            self.review_scroll.verticalScrollBar().setValue(0)
 
     def _cap_changed(self, value: int) -> None:
         self.engine.set_cap(float(value))
@@ -1650,6 +1693,8 @@ class MainWindow(QMainWindow):
             record["status"] = existing["status"]
             if existing.get("approved_path"):
                 record["approved_path"] = existing["approved_path"]
+        if existing and "review_notes" in existing:
+            record["review_notes"] = existing["review_notes"]
         self.candidates[cid] = record
         if cid not in self.order:
             self.order.append(cid)
@@ -1774,20 +1819,27 @@ class MainWindow(QMainWindow):
     def show_record(self, record: dict | None) -> None:
         self.preview_pix = QPixmap()
         if not record:
+            self._shown_id = ""
             self.preview.setPixmap(QPixmap())
             self.preview.setText("Generated images will appear in the list.")
+            self.preview.setFixedHeight(72)
             self.detail.setText("Select an image.")
-            self.issues.clear()
+            self._set_review_notes("")
             self.sent_prompt.clear()
             return
+        cid = str(record.get("id") or "")
+        same = bool(cid) and cid == getattr(self, "_shown_id", "")
         path = str(record.get("path") or "")
         if path and Path(path).is_file():
             self.preview_pix = QPixmap(path)
             self.preview.setText("")
             self._scale_preview()
+            if not same:
+                self.review_scroll.verticalScrollBar().setValue(0)
         else:
             self.preview.setPixmap(QPixmap())
             self.preview.setText(str(record.get("error") or "No image file yet."))
+            self.preview.setFixedHeight(72)
         status = STATUS_TITLES.get(str(record.get("status") or ""), str(record.get("status") or ""))
         bits = [
             str(record.get("product_name") or ""),
@@ -1801,16 +1853,21 @@ class MainWindow(QMainWindow):
             bits.append(str(record["notes"]))
         if record.get("error") and record.get("status") not in {"generating", "reviewing"}:
             bits.append(str(record["error"]))
-        self.detail.setText("\n".join(bit for bit in bits if bit))
-        issues = list(record.get("issues") or [])
+        issues = [str(item).strip() for item in record.get("issues") or [] if str(item).strip()]
+        if issues:
+            bits.append("Reviewer found " + "; ".join(issues))
         instruction = str(record.get("instruction") or "")
-        text = "\n".join(issues)
-        if instruction and instruction not in text and (
+        if instruction and instruction not in " ".join(bits) and (
             record.get("kind") in {"retry", "change"} or str(record.get("status")) == "failed"
         ):
-            text = (text + "\n\n" if text else "") + "Instruction sent with this request:\n" + instruction
-        self.issues.setPlainText(text)
-        self.sent_prompt.setPlainText(str(record.get("prompt") or ""))
+            bits.append(instruction)
+        self.detail.setText("\n".join(bit for bit in bits if bit))
+        if not same or not _keyboard_selected(self.issues):
+            self._set_review_notes(str(record.get("review_notes") or ""))
+        self._shown_id = cid
+        prompt_text = str(record.get("prompt") or "")
+        if (not same or not _keyboard_selected(self.sent_prompt)) and self.sent_prompt.toPlainText() != prompt_text:
+            self.sent_prompt.setPlainText(prompt_text)
         mode = str(record.get("mode") or "")
         if mode == "lock":
             self.change_text.setPlaceholderText("This can change the scene. The product pixels stay in place.")
@@ -1823,11 +1880,28 @@ class MainWindow(QMainWindow):
         else:
             self.change_text.setPlaceholderText("Describe one change. The original brief stays in the request.")
 
-    def _scale_preview(self) -> None:
-        if self.preview_pix.isNull():
+    def _set_review_notes(self, text: str) -> None:
+        self.issues.blockSignals(True)
+        self.issues.setPlainText(text)
+        self.issues.blockSignals(False)
+
+    def _review_notes_edited(self) -> None:
+        record = self.current()
+        if not record:
             return
-        width = max(240, self.preview.width() - 12)
-        self.preview.setPixmap(self.preview_pix.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation))
+        record["review_notes"] = self.issues.toPlainText()
+        self._notes_timer.start(400)
+
+    def _scale_preview(self) -> None:
+        if self.preview_pix.isNull() or not hasattr(self, "review_scroll"):
+            return
+        margins = self.review_scroll.widget().layout().contentsMargins()
+        width = self.review_scroll.viewport().width() - margins.left() - margins.right()
+        if width < 80:
+            return
+        scaled = self.preview_pix.scaledToWidth(width, Qt.TransformationMode.SmoothTransformation)
+        self.preview.setPixmap(scaled)
+        self.preview.setFixedHeight(scaled.height())
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
